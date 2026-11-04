@@ -347,6 +347,19 @@ for example in examples/*.hspl; do
 done
 ```
 
+## Install
+
+Prebuilt binaries for Linux x86-64 are attached to every
+[GitHub release](https://github.com/gooficat/hspl/releases). Download
+`hspl-*.tar.gz`, verify it against the published `.sha256`, unpack, and put
+`hspl` on your `PATH`.
+
+Or build from source (requires LLVM 22, Rust 1.85+, and clang):
+
+```sh
+cargo install --git https://github.com/gooficat/hspl
+```
+
 ## Requirements
 
 - Rust 1.85+ (edition 2024)
@@ -414,6 +427,7 @@ examples/
   void.hspl        void functions, the void default return type, and void main
 .github/workflows/
   ci.yml     GitHub Actions: build, test, and compile every example
+  release.yml  On a `v*` tag: build the Linux x86-64 binary and publish a GitHub release
 ```
 
 Pipeline:

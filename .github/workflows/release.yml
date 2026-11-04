@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The standard library (std/print.s) is x86-64 Linux assembly, so the
+# prebuilt binary targets Linux x86-64 only.
+permissions:
+  contents: write
+
+env:
+  LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+  HSPL_CC: clang-22
+
+jobs:
+  build:
+    name: build Linux x86-64 binary
+    runs-on: ubuntu-24.04 # pinned: apt.llvm.org publishes LLVM 22 for Noble
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 22
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-22-dev clang-22 libpolly-22-dev
+          /usr/lib/llvm-22/bin/llvm-config --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      - name: Package the binary
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="hspl-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${name}"
+          cp target/release/hspl "dist/${name}/"
+          cp LICENSE README.md "dist/${name}/"
+          cp -r examples "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          sha256sum "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.tar.gz.sha256 \
+              --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.tar.gz.sha256 \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "hspl ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
