@@ -51,7 +51,7 @@ jobs:
           cp LICENSE README.md "dist/${name}/"
           cp -r examples "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          sha256sum "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
       - name: Create or update the release
         env:
