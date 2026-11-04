@@ -1,0 +1,32 @@
+// Locals, assignment, shadowing, a mutable global, and implicit widening.
+
+extern print(word) : word;
+
+counter : word 100;
+
+inc(x : word) : word asm {
+    movq $x, $out
+    addq $$1, $out
+}
+
+main() : word {
+    auto a : word, b : word;
+    a = 40;
+    b = 2;
+
+    print(inc(a));
+    print(inc(b));
+
+    counter = 7;
+    print(counter);
+
+    print({
+        // A narrower local with the same name shadows the global.
+        auto counter : int;
+        counter = 41;
+        // `inc` takes a word, so the int is sign-extended at the call.
+        inc(counter)
+    });
+
+    print(counter);
+}

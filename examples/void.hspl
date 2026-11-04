@@ -1,0 +1,35 @@
+// `void`: functions with no return value.
+//
+// A `void` function is called as a statement and produces no value. It cannot
+// be used in an expression, and `void` cannot be used for locals, parameters,
+// or globals — only as a function or `extern` return type.
+//
+// A missing return-type annotation means `void`, so `quiet(...)` below is a
+// `void` function; writing `: void` explicitly means the same thing. Missing
+// value-type annotations (parameters, locals, globals) still mean `word`.
+// A `void` `main` — the default here — is wrapped by the C-ABI `i32 main()`
+// and exits with status 0.
+
+extern print(word) : word;
+
+// No return annotation: void by default.
+quiet(x : word) {
+    print(x);
+}
+
+// A void function called as a statement.
+say(x : word) : void {
+    print(x);
+}
+
+// A void function with several statements.
+announce(a : word, b : word) : void {
+    print(a);
+    print(b);
+}
+
+main() {
+    quiet(5);
+    say(42);
+    announce(7, 9);
+}

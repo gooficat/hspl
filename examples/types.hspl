@@ -1,0 +1,81 @@
+// Primitive types.
+//
+//   word   64-bit integer (the default for value annotations)
+//   int    32-bit integer
+//   short  16-bit integer
+//   byte    8-bit integer
+//   bool    1-bit boolean
+//
+// Types are written after names: `f(x : int) : byte`, `auto n : short;`,
+// `global : word 42;`.
+//
+// Conversions are widening only:
+//   bool -> integer         zero-extends
+//   narrower -> wider       sign-extends
+// Narrowing is a compile error; there are no casts yet.
+//
+// Integer literals adopt the type required by context and are range-checked
+// against both the signed and unsigned interpretations of the width.
+
+extern print(word) : word;
+
+// Globals of every type. `plain` omits the annotation and is a word.
+w : word 0x7FFFFFFFFFFFFFFF;
+i : int 42;
+s : short 1000;
+b : byte 200;              // unsigned spelling; stored as -56
+t : bool true;
+f : bool false;
+plain 7;
+
+// Literals adopt the annotation's type. There are no unary operators, so
+// negative values are written in two's-complement hex.
+small() : byte 127;
+negative() : byte 0x80;       // -128 as an 8-bit value
+minus_one_i32() : int 0xFFFFFFFF;
+yes() : bool 1;
+no() : bool false;
+
+// Widening conversions.
+widen_bool(flag : bool) : int flag;
+widen_byte(x : byte) : word x;
+
+widen_all(x : byte) : int {
+    auto y : short;
+    y = x;                 // byte -> short (sign-extend)
+    y                      // short -> int (sign-extend)
+}
+
+// Typed inline assembly: the result type comes from the annotation, and the
+// byte parameters select 8-bit registers.
+add_bytes(a : byte, b : byte) : byte asm {
+    movb $a, $out
+    addb $b, $out
+}
+
+// A block with no trailing expression yields zero of the expected type.
+nothing() : byte { }
+
+main() : int {
+    print(w);
+    print(i);
+    print(s);
+    print(b);
+    print(t);
+    print(f);
+    print(plain);
+
+    print(small());
+    print(negative());
+    print(minus_one_i32());
+    print(yes());
+    print(no());
+
+    print(widen_bool(true));
+    print(widen_byte(0x7F));
+    print(widen_all(10));
+    print(add_bytes(20, 22));
+    print(nothing());
+
+    42                     // main's result, returned as a 32-bit int
+}

@@ -1,0 +1,50 @@
+// Function bodies are exactly one statement. The value of that statement is
+// the function's result, so there is no `return`. An omitted value-type
+// annotation means `word`; an omitted return-type annotation means `void`.
+
+extern print(word) : word;
+
+identity(x : word) : word x;
+
+always_zero() : word ;
+
+constant() : word 42;
+
+use_block(x : word) : word {
+    auto y : word;
+    y = x;
+    y
+}
+
+add(a : word, b : word) : word asm {
+    movq $a, $out
+    addq $b, $out
+}
+
+main() : word {
+    ;
+
+    print(identity(7));
+    print(always_zero());
+    print(constant());
+    print(use_block(9));
+
+    {
+        print(add(identity(1), identity(41)));
+    }
+
+    print({
+        auto a : word;
+        a = 20;
+        add(a, 22)
+    });
+
+    print(later(40));
+}
+
+// Functions are declared before any body is generated, so `main` can call a
+// function defined later in the file.
+later(x : word) : word asm {
+    movq $x, $out
+    addq $$2, $out
+}

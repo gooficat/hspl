@@ -1,0 +1,74 @@
+// Control flow: `if`, `jump`, and labels.
+//
+// `if cond expr else expr` is an expression: it yields the value of the taken
+// branch. Braces are optional — `{ ... }` is just a statement expression.
+// Without `else`, the false path yields zero. A non-boolean condition is true
+// when it is non-zero.
+//
+// `jump name;` transfers control to `name:` (or the keyword form
+// `label name;`). Labels are function-scoped.
+
+extern print(word) : word;
+
+// Expression branches, no braces required.
+choose(flag : bool) : int if flag 42 else 7;
+
+// `if` as a function body, with block branches.
+non_zero(n : word) : word if n { 1 } else { 0 };
+
+increment(x : word) : word asm {
+    movq $x, $out
+    addq $$1, $out
+}
+
+decrement(x : word) : word asm {
+    movq $x, $out
+    subq $$1, $out
+}
+
+// A backward jump makes a loop: count down from `n`, returning the number of
+// iterations.
+countdown(n : word) : word {
+    auto i : word;
+    auto steps : word;
+    i = n;
+    steps = 0;
+
+    top:
+    if i {
+        i = decrement(i);
+        steps = increment(steps);
+        jump top;
+    }
+
+    steps
+}
+
+// `jump` skips the unreachable statement, and `if` can jump out of a branch.
+skip(flag : bool) : word {
+    auto result : word;
+
+    jump start;
+    111;                  // never executed
+    start:
+    if flag {
+        result = 0;
+        jump after;
+    }
+    result = 222;
+    after:
+    result
+}
+
+main() : word {
+    print(choose(true));
+    print(choose(false));
+    print(non_zero(0));
+    print(non_zero(5));
+    print(countdown(5));
+    print(skip(true));
+    print(skip(false));
+
+    // `if` composes like any other expression.
+    print(if true { 11 } else { 22 });
+}

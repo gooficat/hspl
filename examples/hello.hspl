@@ -1,0 +1,10 @@
+// The smallest useful program: import `print` from the standard library.
+//
+// `extern` declares a typed symbol defined outside this translation unit. The
+// driver links the assembly standard library automatically.
+
+extern print(word) : word;
+
+greeting : word 42;
+
+main() : word print(greeting);

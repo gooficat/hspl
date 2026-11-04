@@ -1,0 +1,45 @@
+// Inline assembly blocks are expressions:
+//   $out          the block's output operand
+//   $name         an input operand, loaded from a variable
+//   $$42          an escaped dollar (an AT&T immediate)
+//   $0, $1, ...   explicit LLVM operand references
+//
+// Operands are numbered output-first: $out is $0, inputs are $1, $2, ...
+// The result type comes from context and defaults to `word`; inputs keep the
+// types of their variables.
+
+extern print(word) : word;
+
+add(a : word, b : word) : word asm {
+    movq $a, $out
+    addq $b, $out
+}
+
+sum3(a : word, b : word, c : word) : word asm {
+    movq $a, $out
+    addq $b, $out
+    addq $c, $out
+}
+
+negate(x : word) : word asm {
+    movq $x, $out
+    negq $out
+}
+
+forty_two() : word asm {
+    movq $$42, $0
+}
+
+// Typed assembly: narrow operands select 8-bit registers.
+add_bytes(a : byte, b : byte) : byte asm {
+    movb $a, $out
+    addb $b, $out
+}
+
+main() : word {
+    print(add(20, 22));
+    print(sum3(1, 2, 39));
+    print(negate(7));
+    print(forty_two());
+    print(add_bytes(20, 22));
+}

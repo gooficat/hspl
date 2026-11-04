@@ -1,0 +1,16 @@
+// Every value has a primitive type, but a missing value-type annotation means
+// `word` (64 bits). Hex literals are two's complement, and a global without
+// an initializer is zero.
+
+extern print(word) : word;
+
+zero : word;
+minus_one : word 0xFFFFFFFFFFFFFFFF;
+max_word : word 0x7FFFFFFFFFFFFFFF;
+
+main() : word {
+    print(zero);
+    print(minus_one);
+    print(max_word);
+    print(0x2a);
+}
