@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Inkwell's llvm22-1 feature expects llvm-config under this prefix.
+  LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+  # The driver links with `clang` by default; use the LLVM 22 build.
+  HSPL_CC: clang-22
+
+jobs:
+  test:
+    name: build & test
+    # Pinned: apt.llvm.org publishes LLVM 22 packages for Ubuntu Noble.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 22
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-22-dev clang-22
+          /usr/lib/llvm-22/bin/llvm-config --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the test suite
+        run: cargo test --locked
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      - name: Compile every example
+        run: |
+          set -euo pipefail
+          for example in examples/*.hspl; do
+            echo "== $example"
+            cargo run --locked --quiet -- "$example" -o "/tmp/$(basename "$example" .hspl)"
+          done
+
+      - name: Run the void example
+        run: /tmp/void

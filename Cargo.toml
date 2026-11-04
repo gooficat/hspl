@@ -1,0 +1,33 @@
+[package]
+name = "hspl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Hasan's Simple Programming Language - a B-like, operator-free language with inline assembly, targeting LLVM"
+license = "MIT"
+repository = "https://github.com/gooficat/hspl"
+homepage = "https://github.com/gooficat/hspl"
+keywords = ["compiler", "language", "llvm", "compiler-backend"]
+categories = ["compilers"]
+exclude = ["target", "a.out", ".github"]
+
+[lib]
+name = "hspl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hspl"
+path = "src/main.rs"
+
+[dependencies]
+# Inkwell 0.11 wraps llvm-sys 221, matching the LLVM 22 toolchain on this machine.
+# `default-features = false` drops the "all targets" default; enable the targets
+# you actually want to emit for. Add "target-aarch64" etc. as needed.
+inkwell = { version = "0.11", default-features = false, features = ["llvm22-1", "target-x86"] }
+
+[profile.dev]
+# LLVM bindings are unusably slow without at least some optimization.
+opt-level = 1
+
+[profile.release]
+lto = "thin"
