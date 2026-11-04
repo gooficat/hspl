@@ -6,11 +6,12 @@
 
 use std::fmt;
 
-/// A token kind. Identifiers and integers carry their value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A token kind. Identifiers carry their name; numbers carry their value.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Ident(String),
     Int(i64),
+    Float(f64),
     /// Raw body of an `asm { ... }` block (the braces are not included).
     Asm(String),
     Auto,
@@ -37,6 +38,7 @@ impl fmt::Display for TokenKind {
         match self {
             TokenKind::Ident(name) => write!(f, "identifier `{name}`"),
             TokenKind::Int(value) => write!(f, "integer `{value}`"),
+            TokenKind::Float(value) => write!(f, "floating-point `{value}`"),
             TokenKind::Asm(_) => write!(f, "an `asm` block"),
             TokenKind::Auto => write!(f, "`auto`"),
             TokenKind::Extern => write!(f, "`extern`"),
@@ -60,7 +62,7 @@ impl fmt::Display for TokenKind {
 }
 
 /// A token plus the line it started on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
@@ -263,20 +265,88 @@ impl Lexer {
                 .map_err(|_| format!("line {line}: integer literal `0x{digits}` is out of range"));
         }
 
-        let mut digits = String::new();
+        let mut int_digits = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
-                digits.push(c);
+                int_digits.push(c);
                 self.bump();
             } else {
                 break;
             }
         }
 
-        digits
-            .parse::<i64>()
-            .map(TokenKind::Int)
-            .map_err(|_| format!("line {line}: integer literal `{digits}` is out of range"))
+        // Optional fractional part: `1.5` or `1.`. At least one digit must
+        // lead the literal (`.5` is not accepted).
+        let mut frac_digits = String::new();
+        let mut has_fraction = false;
+        if self.peek() == Some('.') {
+            self.bump();
+            has_fraction = true;
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    frac_digits.push(c);
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Optional decimal exponent: `1e10`, `1.5E-3`, `2e+5`.
+        let mut exp_digits = String::new();
+        let mut exp_sign = String::new();
+        let mut has_exponent = false;
+        if matches!(self.peek(), Some('e' | 'E')) {
+            self.bump();
+            has_exponent = true;
+            match self.peek() {
+                Some('+') => {
+                    exp_sign.push('+');
+                    self.bump();
+                }
+                Some('-') => {
+                    exp_sign.push('-');
+                    self.bump();
+                }
+                _ => {}
+            }
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    exp_digits.push(c);
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            if exp_digits.is_empty() {
+                return Err(format!("line {line}: malformed floating-point literal exponent"));
+            }
+        }
+
+        if !has_fraction && !has_exponent {
+            // A plain integer literal.
+            return match int_digits.parse::<i64>() {
+                Ok(value) => Ok(TokenKind::Int(value)),
+                Err(_) => {
+                    Err(format!("line {line}: integer literal `{int_digits}` is out of range"))
+                }
+            };
+        }
+
+        // A floating-point literal. Parse it with Rust's correctly-rounded
+        // parser, so the stored value is exactly the nearest f64 to the
+        // written digits. Overflow to infinity is rejected later, when the
+        // target type (float or double) is known.
+        let frac = if frac_digits.is_empty() { "0" } else { &frac_digits };
+        let mut text = format!("{int_digits}.{frac}");
+        if has_exponent {
+            text.push('e');
+            text.push_str(&exp_sign);
+            text.push_str(&exp_digits);
+        }
+        text.parse::<f64>().map(TokenKind::Float).map_err(|_| {
+            format!("line {line}: floating-point literal `{text}` is out of range")
+        })
     }
 
     fn symbol(&mut self, line: usize) -> Result<TokenKind, String> {
@@ -427,5 +497,59 @@ mod tests {
     #[test]
     fn rejects_unterminated_asm() {
         assert!(tokenize("asm { movq x").is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    fn kinds(source: &str) -> Vec<TokenKind> {
+        tokenize(source)
+            .expect("source should tokenize")
+            .into_iter()
+            .map(|token| token.kind)
+            .collect()
+    }
+
+    #[test]
+    fn tokenizes_float_literals() {
+        assert_eq!(
+            kinds("3.5 1e10 1.5e-3 2E+5 4. 0.5"),
+            vec![
+                TokenKind::Float(3.5),
+                TokenKind::Float(1e10),
+                TokenKind::Float(1.5e-3),
+                TokenKind::Float(2e5),
+                TokenKind::Float(4.0),
+                TokenKind::Float(0.5),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn integer_literals_are_still_integers() {
+        assert_eq!(kinds("42"), vec![TokenKind::Int(42), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn rejects_missing_exponent_digits() {
+        let error = tokenize("1e").unwrap_err();
+        assert!(error.contains("exponent"), "{error}");
+        let error = tokenize("2.5E-").unwrap_err();
+        assert!(error.contains("exponent"), "{error}");
+    }
+
+    #[test]
+    fn float_literal_values_are_precise() {
+        // Values are parsed with round-to-nearest-even, so the stored f64 is
+        // exactly what the writer meant.
+        assert_eq!(kinds("0.1"), vec![TokenKind::Float(0.1), TokenKind::Eof]);
+        assert_eq!(
+            kinds("3.141592653589793"),
+            vec![TokenKind::Float(3.141592653589793), TokenKind::Eof]
+        );
     }
 }

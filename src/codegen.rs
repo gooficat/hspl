@@ -1,11 +1,12 @@
 //! LLVM IR generation for HSPL.
 //!
-//! Every value has one of six types: five value types (`word`, `int`, `short`,
-//! `byte`, `bool`) plus `void`, which is only valid as a function or `extern`
+//! Every value has one of eight types: five integer types (`word`, `int`,
+//! `short`, `byte`, `bool`), two IEEE-754 floating-point types (`float`,
+//! `double`), and `void`, which is only valid as a function or `extern`
 //! return type and produces no value. They are represented as LLVM `i64`,
-//! `i32`, `i16`, `i8`, `i1`, and `void`. There are no operators; computation
-//! happens through function calls, inline assembly, and a small set of
-//! control-flow constructs.
+//! `i32`, `i16`, `i8`, `i1`, `f32`, `f64`, and `void`. There are no
+//! operators; computation happens through function calls, inline assembly, and
+//! a small set of control-flow constructs.
 //!
 //! - Globals become module-level globals of their declared type.
 //! - Functions use their annotated parameter and return types. The result is the
@@ -13,7 +14,9 @@
 //! - `extern name(types...) : ret;` declares a typed symbol defined elsewhere
 //!   (for example the standard library's `print`).
 //! - Implicit conversion is widening only: `bool` zero-extends, narrower
-//!   integers sign-extend, and narrowing is rejected.
+//!   integers sign-extend, `float` widens to `double`, and an integer widens
+//!   to a floating-point type only when exactly representable (`byte` and
+//!   `short` to `float`; up to `int` to `double`). Narrowing is rejected.
 //! - Integer literals take their type from context and are range-checked.
 //! - `if` becomes a conditional branch and a phi joining the branch values.
 //!   Non-boolean conditions are compared against zero.
@@ -32,12 +35,14 @@
 //! }
 //! ```
 //!
-//! `$out` is the block's output operand (constraint `=r`); each distinct `$name`
-//! is an input operand (`r`) loaded from a variable. Operands are numbered
-//! output-first, so `$a` becomes `$1` and `$out` becomes `$0`. `$$` escapes a
-//! literal dollar for immediates (`movq $$42, $out`). The result type comes from
-//! context (the return type or parameter type) and defaults to `word`; inputs
-//! keep their variables' types.
+//! `$out` is the block's output operand; each distinct `$name` is an input
+//! operand loaded from a variable. Operands are numbered output-first, so
+//! `$a` becomes `$1` and `$out` becomes `$0`. `$$` escapes a literal dollar
+//! for immediates (`movq $$42, $out`). The result type comes from context
+//! (the return type or parameter type) and defaults to `word`; inputs keep
+//! their variables' types. Integer operands use the `r` constraint;
+//! floating-point operands use the `x` constraint (an SSE register on
+//! x86-64).
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,9 +53,9 @@ use inkwell::module::Module;
 use inkwell::targets::TargetMachine;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
-use inkwell::IntPredicate;
+use inkwell::{FloatPredicate, IntPredicate};
 
-use crate::ast::{Binding, Block, Expr, Function, Item, Program, Stmt, Type};
+use crate::ast::{Binding, Block, Expr, Function, Item, Literal, Program, Stmt, Type};
 
 /// The standard library defines `print`, so a program cannot also define it.
 const RESERVED_PRINT: &str =
@@ -153,6 +158,9 @@ fn check_literal(value: i64, ty: Type, context: &str) -> Result<(), String> {
         Type::Short => (-(1i128 << 15), (1i128 << 16) - 1),
         Type::Byte => (-(1i128 << 7), (1i128 << 8) - 1),
         Type::Bool => (0, 1),
+        Type::Float | Type::Double => {
+            unreachable!("literal_value routes floating-point targets before check_literal")
+        }
         Type::Void => return Ok(()),
     };
 
@@ -166,6 +174,34 @@ fn check_literal(value: i64, ty: Type, context: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Check that `value` can be represented by `ty` when written as a
+/// floating-point literal. Overflow to infinity (or an already-infinite
+/// value) is rejected.
+fn check_float_literal(value: f64, ty: Type, context: &str) -> Result<(), String> {
+    let limit = match ty {
+        Type::Float => f32::MAX as f64,
+        Type::Double => f64::MAX,
+        _ => unreachable!("literal_value routes floating-point targets before check_float_literal"),
+    };
+    if !value.is_finite() || value.abs() > limit {
+        return Err(format!(
+            "{context} {value} is out of range for `{}`",
+            ty.name()
+        ));
+    }
+    Ok(())
+}
+
+/// The largest integer magnitude exactly representable in `ty`. `i64` literals
+/// beyond this cannot be converted to a float constant without rounding.
+fn exact_integer_limit(ty: Type) -> i128 {
+    match ty {
+        Type::Float => 1i128 << 24,
+        Type::Double => 1i128 << 53,
+        _ => i64::MAX as i128,
+    }
+}
+
 impl<'ctx> Codegen<'ctx> {
     // ----- types ---------------------------------------------------------
 
@@ -177,13 +213,42 @@ impl<'ctx> Codegen<'ctx> {
             Type::Byte => self.context.i8_type(),
             Type::Bool => self.context.bool_type(),
             Type::Void => panic!("internal error: `void` has no integer representation"),
+            Type::Float | Type::Double => {
+                panic!("internal error: `{}` has no integer representation", ty.name())
+            }
         }
     }
 
+    fn float_type(&self, ty: Type) -> inkwell::types::FloatType<'ctx> {
+        match ty {
+            Type::Float => self.context.f32_type(),
+            Type::Double => self.context.f64_type(),
+            _ => panic!("internal error: `{}` has no floating-point representation", ty.name()),
+        }
+    }
+
+    /// The LLVM type for any first-class HSPL type.
     fn llvm_type(&self, ty: Type) -> BasicTypeEnum<'ctx> {
         match ty {
             Type::Void => panic!("internal error: `void` is not a first-class LLVM type"),
+            Type::Float => self.context.f32_type().into(),
+            Type::Double => self.context.f64_type().into(),
             _ => self.int_type(ty).into(),
+        }
+    }
+
+    /// The LLVM function type for a signature. `void` returns LLVM `void`;
+    /// floating-point returns use the matching float type; everything else is
+    /// an integer.
+    fn fn_type(
+        &self,
+        ret: Type,
+        params: &[BasicMetadataTypeEnum<'ctx>],
+    ) -> inkwell::types::FunctionType<'ctx> {
+        match ret {
+            Type::Void => self.context.void_type().fn_type(params, false),
+            Type::Float | Type::Double => self.float_type(ret).fn_type(params, false),
+            _ => self.int_type(ret).fn_type(params, false),
         }
     }
 
@@ -200,11 +265,55 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// An integer constant of `ty` with the bit pattern of `value`. `ty` must
-    /// be a value type, not `void`.
+    /// be a value type, not `void` and not floating-point.
     fn constant(&self, ty: Type, value: i64) -> TypedValue<'ctx> {
         TypedValue {
             value: Some(self.int_type(ty).const_int(value as u64, false).into()),
             ty,
+        }
+    }
+
+    /// A floating-point constant of `ty` (`float` or `double`).
+    fn float_constant(&self, ty: Type, value: f64) -> TypedValue<'ctx> {
+        TypedValue {
+            value: Some(self.float_type(ty).const_float(value).into()),
+            ty,
+        }
+    }
+
+    /// Build a typed constant from a written literal, checking it against
+    /// `ty`. Integer literals adopt a floating-point `ty` only when exactly
+    /// representable; floating-point literals are only valid for floating-point
+    /// `ty`.
+    fn literal_value(
+        &self,
+        ty: Type,
+        literal: &Literal,
+        context: &str,
+    ) -> Result<TypedValue<'ctx>, String> {
+        match (literal, ty) {
+            (Literal::Int(value), Type::Float | Type::Double) => {
+                if (*value as i128).abs() <= exact_integer_limit(ty) {
+                    Ok(self.float_constant(ty, *value as f64))
+                } else {
+                    Err(format!(
+                        "{context} {value} is out of range for `{}` (must be exactly representable)",
+                        ty.name()
+                    ))
+                }
+            }
+            (Literal::Int(value), _) => {
+                check_literal(*value, ty, context)?;
+                Ok(self.constant(ty, *value))
+            }
+            (Literal::Float(value), Type::Float | Type::Double) => {
+                check_float_literal(*value, ty, context)?;
+                Ok(self.float_constant(ty, *value))
+            }
+            (Literal::Float(value), _) => Err(format!(
+                "{context} {value} cannot be used as `{}`",
+                ty.name()
+            )),
         }
     }
 
@@ -234,7 +343,44 @@ impl<'ctx> Codegen<'ctx> {
             ));
         }
 
-        let input = value.value.expect("value type has a value").into_int_value();
+        let input = value.value.expect("value type has a value");
+
+        // Floating-point targets: widening between floats, or an exact
+        // integer (or bool) to float.
+        if target.is_float() {
+            let target_type = self.float_type(target);
+            if value.ty.is_float() {
+                let extended = build(
+                    self.builder.build_float_ext(input.into_float_value(), target_type, "fpext"),
+                )?;
+                return Ok(TypedValue {
+                    value: Some(extended.into()),
+                    ty: target,
+                });
+            }
+            if value.ty.is_bool() {
+                let extended = build(
+                    self.builder
+                        .build_unsigned_int_to_float(input.into_int_value(), target_type, "uitofp"),
+                )?;
+                return Ok(TypedValue {
+                    value: Some(extended.into()),
+                    ty: target,
+                });
+            }
+            let extended = build(
+                self.builder
+                    .build_signed_int_to_float(input.into_int_value(), target_type, "sitofp"),
+            )?;
+            return Ok(TypedValue {
+                value: Some(extended.into()),
+                ty: target,
+            });
+        }
+
+        // Integer targets can only come from integer sources: a float source
+        // would have been rejected by `can_widen_to`.
+        let input = input.into_int_value();
         let target_type = self.int_type(target);
         let extended = if value.ty.is_bool() {
             build(self.builder.build_int_z_extend(input, target_type, "zext"))?
@@ -284,15 +430,13 @@ impl<'ctx> Codegen<'ctx> {
 
         for item in &program.items {
             if let Item::Global(global) = item {
-                check_literal(
-                    global.init,
-                    global.ty,
-                    &format!("global `{}` initializer", global.name),
-                )?;
+                let context = format!("global `{}` initializer", global.name);
+                let constant = self.literal_value(global.ty, &global.init, &context)?;
                 let value = self
                     .module
-                    .add_global(self.int_type(global.ty), None, &global.name);
-                value.set_initializer(&self.int_type(global.ty).const_int(global.init as u64, false));
+                    .add_global(self.llvm_type(global.ty), None, &global.name);
+                let basic = constant.value.expect("global initializer has a value");
+                value.set_initializer(&basic);
                 self.globals.insert(
                     global.name.clone(),
                     (value.as_pointer_value(), global.ty),
@@ -305,9 +449,9 @@ impl<'ctx> Codegen<'ctx> {
                 let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = decl
                     .params
                     .iter()
-                    .map(|ty| self.int_type(*ty).into())
+                    .map(|ty| self.llvm_type(*ty).into())
                     .collect();
-                let fn_type = self.int_type(decl.ret).fn_type(&param_types, false);
+                let fn_type = self.fn_type(decl.ret, &param_types);
                 let value = self.module.add_function(&decl.name, fn_type, None);
                 self.externs.insert(
                     decl.name.clone(),
@@ -330,8 +474,16 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn declare_function(&mut self, function: &Function) -> Result<(), String> {
-        if function.name == "main" && !function.params.is_empty() {
-            return Err("`main` cannot take parameters".to_string());
+        if function.name == "main" {
+            if !function.params.is_empty() {
+                return Err("`main` cannot take parameters".to_string());
+            }
+            if function.ret.is_float() {
+                return Err(
+                    "`main` cannot return `float` or `double`; use an integer type (or omit the annotation for `void`)"
+                        .to_string(),
+                );
+            }
         }
 
         let mut params = HashSet::new();
@@ -353,14 +505,9 @@ impl<'ctx> Codegen<'ctx> {
         let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = function
             .params
             .iter()
-            .map(|param| self.int_type(param.ty).into())
+            .map(|param| self.llvm_type(param.ty).into())
             .collect();
-        // `void` is only a return type; it maps to LLVM `void`, not an integer
-        // type, so build the function type with the right return kind directly.
-        let fn_type = match function.ret {
-            Type::Void => self.context.void_type().fn_type(&param_types, false),
-            _ => self.int_type(function.ret).fn_type(&param_types, false),
-        };
+        let fn_type = self.fn_type(function.ret, &param_types);
 
         let llvm_name = Self::llvm_function_name(&function.name);
         let value = self.module.add_function(&llvm_name, fn_type, None);
@@ -411,7 +558,7 @@ impl<'ctx> Codegen<'ctx> {
         for (index, param) in function.params.iter().enumerate() {
             let slot = build(
                 self.alloca_builder
-                    .build_alloca(self.int_type(param.ty), &param.name),
+                    .build_alloca(self.llvm_type(param.ty), &param.name),
             )?;
             let arg = sig
                 .value
@@ -494,6 +641,9 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::Bool => build(self.builder.build_int_z_extend(value, i32_type, "zext"))?,
             Type::Void => unreachable!("handled above"),
+            Type::Float | Type::Double => {
+                unreachable!("`main` cannot return a floating-point type")
+            }
         };
 
         let returned: BasicValueEnum = converted.into();
@@ -719,22 +869,30 @@ impl<'ctx> Codegen<'ctx> {
         })
     }
 
-    /// Turn a condition value into an `i1`: booleans are used directly, and
-    /// integers are true when non-zero.
+    /// Turn a condition value into an `i1`. Booleans are used directly,
+    /// integers are true when non-zero, and floating-point values are true
+    /// when not equal to zero (NaN is false, as in C).
     fn as_condition(&mut self, value: TypedValue<'ctx>) -> Result<IntValue<'ctx>, String> {
         if value.ty.is_void() {
             return Err("cannot use `void` as a condition".to_string());
         }
-        let int_value = value.value.expect("condition is a value").into_int_value();
         if value.ty.is_bool() {
-            Ok(int_value)
-        } else {
-            let zero = self.int_type(value.ty).const_zero();
-            build(
-                self.builder
-                    .build_int_compare(IntPredicate::NE, int_value, zero, "cond"),
-            )
+            return Ok(value.value.expect("condition is a value").into_int_value());
         }
+        if value.ty.is_float() {
+            let float_value = value.value.expect("condition is a value").into_float_value();
+            let zero = self.float_type(value.ty).const_zero();
+            return build(
+                self.builder
+                    .build_float_compare(FloatPredicate::ONE, float_value, zero, "cond"),
+            );
+        }
+        let int_value = value.value.expect("condition is a value").into_int_value();
+        let zero = self.int_type(value.ty).const_zero();
+        build(
+            self.builder
+                .build_int_compare(IntPredicate::NE, int_value, zero, "cond"),
+        )
     }
 
     fn declare_local(&mut self, binding: &Binding) -> Result<(), String> {
@@ -761,7 +919,7 @@ impl<'ctx> Codegen<'ctx> {
         // declaration (so a declaration inside a loop resets each iteration).
         let slot = build(
             self.alloca_builder
-                .build_alloca(self.int_type(binding.ty), &binding.name),
+                .build_alloca(self.llvm_type(binding.ty), &binding.name),
         )?;
         // `binding.ty` is never `void` (validated in `declare_function`), so
         // the zero value always exists.
@@ -796,20 +954,24 @@ impl<'ctx> Codegen<'ctx> {
         match expr {
             Expr::Int(value) => {
                 let ty = expected.unwrap_or(Type::Word);
-                check_literal(*value, ty, "integer literal")?;
-                Ok(self.constant(ty, *value))
+                self.literal_value(ty, &Literal::Int(*value), "integer literal")
+            }
+            Expr::Float(value) => {
+                let ty = expected.unwrap_or(Type::Double);
+                self.literal_value(ty, &Literal::Float(*value), "floating-point literal")
             }
             // A boolean literal is `bool` on its own, but adopts an expected
-            // integer type directly (equivalent to zero-extension).
+            // integer type directly (equivalent to zero-extension), and an
+            // expected floating-point type exactly (0.0 or 1.0).
             Expr::Bool(value) => {
                 let ty = expected.unwrap_or(Type::Bool);
-                Ok(self.constant(ty, i64::from(*value)))
+                self.literal_value(ty, &Literal::Int(i64::from(*value)), "boolean literal")
             }
             Expr::Var(name) => {
                 let (slot, ty) = self
                     .lookup(name)
                     .ok_or_else(|| format!("use of undefined variable `{name}`"))?;
-                let loaded = build(self.builder.build_load(self.int_type(ty), slot, name))?;
+                let loaded = build(self.builder.build_load(self.llvm_type(ty), slot, name))?;
                 let value = TypedValue { value: Some(loaded), ty };
                 match expected {
                     Some(target) => self.coerce(value, target),
@@ -898,21 +1060,26 @@ impl<'ctx> Codegen<'ctx> {
 
         let mut args = Vec::with_capacity(inputs.len());
         let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(inputs.len());
+        let mut input_types: Vec<Type> = Vec::with_capacity(inputs.len());
         for name in &inputs {
             let (slot, ty) = self
                 .lookup(name)
                 .ok_or_else(|| format!("asm block references undefined variable `${name}`"))?;
-            let value = build(self.builder.build_load(self.int_type(ty), slot, name))?;
+            let value = build(self.builder.build_load(self.llvm_type(ty), slot, name))?;
             args.push(value.into());
-            param_types.push(self.int_type(ty).into());
+            param_types.push(self.llvm_type(ty).into());
+            input_types.push(ty);
         }
 
-        let fn_type = self.int_type(result_ty).fn_type(&param_types, false);
+        let fn_type = self.fn_type(result_ty, &param_types);
 
-        // One output (`=r`) followed by one input register per variable.
-        let mut constraints = String::from("=r");
-        for _ in &inputs {
-            constraints.push_str(",r");
+        // One output followed by one input register per variable. Floating-point
+        // operands use the `x` constraint (SSE registers), integers use `r`.
+        let constraint_for = |ty: Type| if ty.is_float() { "x" } else { "r" };
+        let mut constraints = format!("={}", constraint_for(result_ty));
+        for &ty in &input_types {
+            constraints.push(',');
+            constraints.push_str(constraint_for(ty));
         }
 
         let asm = self.context.create_inline_asm(
@@ -1452,5 +1619,165 @@ mod tests {
                 vec!["a".to_string(), "b".to_string()]
             )
         );
+    }
+
+    #[test]
+    fn floats_are_first_class_types() {
+        let text = ir("f(x : float, y : double) : double y;");
+        assert!(text.contains("define double @f(float %0, double %1)"), "{text}");
+        let text = ir("f() : float 1.0;");
+        assert!(text.contains("define float @f()"), "{text}");
+    }
+
+    #[test]
+    fn float_globals_are_emitted() {
+        let text = ir("pi : double 3.25;\nzero : float;\nplain 7;");
+        assert!(text.contains("@pi = global double 3.250000e+00"), "{text}");
+        assert!(text.contains("@zero = global float 0.000000e+00"), "{text}");
+        assert!(text.contains("@plain = global i64 7"), "{text}");
+    }
+
+    #[test]
+    fn float_widens_to_double() {
+        let text = ir("f(x : float) : double { auto d : double; d = x; d }");
+        assert!(text.contains("fpext float"), "{text}");
+        assert!(text.contains("ret double"), "{text}");
+    }
+
+    #[test]
+    fn narrow_integers_widen_into_float() {
+        let text = ir("f(x : byte) : float { auto d : float; d = x; d }");
+        assert!(text.contains("sitofp i8"), "{text}");
+        let text = ir("f(x : short) : float { auto d : float; d = x; d }");
+        assert!(text.contains("sitofp i16"), "{text}");
+    }
+
+    #[test]
+    fn int_widens_to_double_but_not_float() {
+        let text = ir("f(x : int) : double x;");
+        assert!(text.contains("sitofp i32"), "{text}");
+        let error = ir_err("f(x : int) : float x;");
+        assert!(
+            error.contains("cannot implicitly convert `int` to `float`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn word_does_not_widen_to_double() {
+        let error = ir_err("f(x : word) : double x;");
+        assert!(
+            error.contains("cannot implicitly convert `word` to `double`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn floats_do_not_widen_to_integers() {
+        let error = ir_err("f(x : double) : word x;");
+        assert!(
+            error.contains("cannot implicitly convert `double` to `word`"),
+            "{error}"
+        );
+        let error = ir_err("f(x : float) : int { auto d : int; d = x; d }");
+        assert!(
+            error.contains("cannot implicitly convert `float` to `int`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bool_zero_extends_into_floats() {
+        // A boolean literal adopts the float type directly (exact 0.0/1.0).
+        let text = ir("f() : double { auto d : double; d = true; d }");
+        assert!(text.contains("1.000000e+00"), "{text}");
+        // A boolean variable zero-extends into the float.
+        let text = ir("f(b : bool) : double { auto d : double; d = b; d }");
+        assert!(text.contains("uitofp i1"), "{text}");
+        let text = ir("f(b : bool) : float { auto d : float; d = b; d }");
+        assert!(text.contains("uitofp i1"), "{text}");
+    }
+
+    #[test]
+    fn float_literals_adopt_float_context() {
+        let text = ir("f() : double 1.5;");
+        assert!(text.contains("define double @f()"), "{text}");
+        assert!(text.contains("1.500000e+00"), "{text}");
+        let text = ir("f() : float 1.5;");
+        assert!(text.contains("define float @f()"), "{text}");
+        assert!(text.contains("1.500000e+00"), "{text}");
+    }
+
+    #[test]
+    fn integer_literals_adopt_float_context() {
+        let text = ir("f() : double 2;");
+        assert!(text.contains("2.000000e+00"), "{text}");
+    }
+
+    #[test]
+    fn inexact_integer_literal_for_float_is_rejected() {
+        // 2^24 + 1 is not representable in f32.
+        let error = ir_err("f() : float 16777217;");
+        assert!(error.contains("out of range for `float`"), "{error}");
+        // 2^53 + 1 is not representable in f64.
+        let error = ir_err("f() : double 9007199254740993;");
+        assert!(error.contains("out of range for `double`"), "{error}");
+    }
+
+    #[test]
+    fn float_literal_overflow_is_rejected() {
+        let error = ir_err("f() : double 1e999;");
+        assert!(error.contains("out of range for `double`"), "{error}");
+        let error = ir_err("f() : float 1e999;");
+        assert!(error.contains("out of range for `float`"), "{error}");
+        let error = ir_err("big : double 1e999;");
+        assert!(error.contains("global `big` initializer"), "{error}");
+    }
+
+    #[test]
+    fn float_literal_in_integer_context_is_rejected() {
+        let error = ir_err("f() : word 1.5;");
+        assert!(error.contains("cannot be used as `word`"), "{error}");
+        let error = ir_err("f() : bool 1.5;");
+        assert!(error.contains("cannot be used as `bool`"), "{error}");
+    }
+
+    #[test]
+    fn float_conditions_compare_with_zero() {
+        let text = ir("f(d : double) : word if d { 1 } else { 2 };");
+        assert!(text.contains("fcmp one double"), "{text}");
+        let text = ir("f(x : float) : word if x { 1 } else { 2 };");
+        assert!(text.contains("fcmp one float"), "{text}");
+    }
+
+    #[test]
+    fn float_asm_uses_the_x_constraint() {
+        let text = ir("f(x : double) : double asm { movsd $x, $out }");
+        assert!(text.contains("call double asm"), "{text}");
+        assert!(text.contains("=x,x"), "{text}");
+    }
+
+    #[test]
+    fn extern_float_signatures() {
+        let text = ir("extern convert(float, double) : double;\nmain() convert(1.5, 2.5);");
+        assert!(text.contains("declare double @convert(float, double)"), "{text}");
+    }
+
+    #[test]
+    fn main_cannot_return_a_float() {
+        let error = ir_err("main() : float 1.0;");
+        assert!(error.contains("`main` cannot return `float`"), "{error}");
+    }
+
+    #[test]
+    fn float_global_initializers() {
+        let text = ir("pi : double 3.25;\nf() : double pi;");
+        assert!(text.contains("@pi = global double 3.250000e+00"), "{text}");
+    }
+
+    #[test]
+    fn int_literal_adopts_float_global_initializer() {
+        let text = ir("two : double 2;");
+        assert!(text.contains("@two = global double 2.000000e+00"), "{text}");
     }
 }

@@ -3,7 +3,7 @@
 [![CI](https://github.com/gooficat/hspl/actions/workflows/ci.yml/badge.svg)](https://github.com/gooficat/hspl/actions/workflows/ci.yml)
 
 **Hasan's Simple Programming Language** — a small, B-like systems language
-that compiles to LLVM IR. HSPL has six primitive types, no operators, and no
+that compiles to LLVM IR. HSPL has eight primitive types, no operators, and no
 `return` statements: arithmetic is done in inline assembly, control flow is an
 `if` expression plus labels and `jump`, and every function body is exactly one
 statement whose value is the function's result. Programs link against a tiny
@@ -95,8 +95,9 @@ HSPL is deliberately stripped down, in the spirit of B:
   and the function returns the value of that statement. Multi-statement bodies
   are written as Rust-style statement expressions.
 - **Explicit conversions only where they widen.** `bool` zero-extends to any
-  integer; narrower integers sign-extend to wider ones. Narrowing is a compile
-  error, and there are no casts yet.
+  integer or float; narrower integers sign-extend to wider ones; `float`
+  widens to `double`; an integer widens to a float type only when exactly
+  representable. Narrowing is a compile error, and there are no casts yet.
 - **Minimal control flow.** `if` is an expression; `jump` transfers to a
   function-scoped label; backward jumps build loops. There is no `while`,
   `for`, or `switch` yet.
@@ -152,7 +153,7 @@ statement := 'auto' binding (',' binding)* ';'
            | ';'                              // empty statement
            | expression                        // block-like expression, no ';'
 
-expression := integer | 'true' | 'false'
+expression := integer | float | 'true' | 'false'
            | ident | ident '(' [expression (',' expression)*] ')'
            | 'asm' '{' raw assembly '}'
            | 'if' ['('] expression [')'] expression ['else' expression]
@@ -166,7 +167,7 @@ annotation (on a parameter, local, or global) means `word`; a missing
 
 ### Types and conversions
 
-HSPL has six types. Types come after the name they describe.
+HSPL has eight types. Types come after the name they describe.
 
 ```hspl
 answer : word 42;                // global
@@ -183,6 +184,8 @@ f(x : byte, y : short) : int {   // parameters and return type
 | `short`| `i16`  | 16   | -2¹⁵ .. 2¹⁶-1                     |
 | `byte` | `i8`   | 8    | -2⁷ .. 2⁸-1                       |
 | `bool` | `i1`   | 1    | `0`, `1`, `true`, `false`         |
+| `float`| `f32`  | 32   | any finite IEEE-754 single        |
+| `double`| `f64` | 64   | any finite IEEE-754 double        |
 | `void` | —      | —    | no value; the default return type |
 
 **Integer literals** adopt the type required by context — a literal is never
@@ -192,6 +195,20 @@ and `int 0xFFFFFFFF` stores `-1`. Hex literals wrap to 64 bits, which is how
 the full range of `word` is written. There is no unary minus, so negative
 values are normally written in two's-complement hex (`byte 0x80` is `-128`).
 
+**Floating-point literals** are decimal, with an optional fraction and an
+optional exponent: `1.5`, `1.`, `0.5`, `1e10`, `1.5E-3`, `2e+5`. A literal must
+start with a digit (`.5` is not accepted). Values are parsed with correct
+rounding — the nearest representable value, round to nearest even — so the
+stored constant is exactly what was written; `0.1` stores the exact f64 nearest
+0.1. Hex literals are integers only; hexadecimal float literals are on the
+[roadmap](#roadmap). A floating-point literal adopts its expected type and is
+then range-checked, exactly like an integer literal: it defaults to `double`,
+is rejected in `float` context when the value is out of range or not finite
+(e.g. `1e999`), and cannot be used as an integer. An integer literal adopts a
+floating-point context only when exactly representable: `double d = 2;` is
+fine; `double d = 9007199254740993;` is an error, because 2⁵³+1 is not
+representable.
+
 **`void`** produces no value. A `void` function is called as a statement and
 its result cannot be used in an expression. `void` is only valid as a function
 or `extern` return type — never for locals, parameters, or globals — and it
@@ -200,10 +217,13 @@ is the default when a function or `extern` omits its return type. A `void`
 
 **Conversions** are implicit only when widening:
 
-- `bool` → any integer (zero-extend)
+- `bool` → any integer (zero-extend) or float/double (exact `0.0`/`1.0`)
 - `byte` → `short` → `int` → `word` (sign-extend)
+- `float` → `double` (widen)
+- `byte` → `float`, `short` → `float` (exactly representable)
+- `byte` → `double`, `short` → `double`, `int` → `double` (exactly representable)
 
-Anything else is rejected, including narrowing and same-width conversions:
+Anything else is rejected, including narrowing, same-width conversions, and any float-to-integer conversion (an explicit conversion does not exist yet):
 
 ```hspl
 f(x : word) : byte x;   // error: cannot implicitly convert `word` to `byte`
@@ -256,6 +276,7 @@ block is an error.
 | Form                        | Meaning                                                  |
 | --------------------------- | -------------------------------------------------------- |
 | `42`, `0x2a`                | Integer literal; adopts the expected type, range-checked  |
+| `1.5`, `1e10`               | Floating-point literal; adopts the expected type (`double` by default), range-checked |
 | `true`, `false`             | Boolean literal                                          |
 | `name`                      | Variable or global                                        |
 | `f(a, b)`                   | Function call                                             |
@@ -300,7 +321,7 @@ choose(flag : bool) : int if flag { 42 } else { 7 };
 
 - It yields the value of the taken branch. Without `else`, the false path
   yields zero of the expected type.
-- The condition may be `bool`, or any integer, which is true when non-zero.
+- The condition may be `bool`, or any integer, which is true when non-zero; a floating-point condition is true when it is not zero (NaN is false).
 - Both `if cond ...` and `if (cond) ...` are accepted.
 - Each branch is an expression, and `{ ... }` is itself an expression, so
   braces are optional: `choose(flag) : int if flag 42 else 7;`
@@ -343,7 +364,8 @@ function return type, a parameter type, or the variable being assigned — and
 defaults to `word`. In statement position it is evaluated for its side effects
 and its result is discarded. The body is raw assembly for the host target,
 parsed by LLVM's inline-asm parser (AT&T dialect by default); input operands
-keep their variables' types.
+keep their variables' types. Floating-point operands use the `x` constraint
+(an SSE register on x86-64); integer operands use `r`.
 
 ```hspl
 add(a : word, b : word) : word asm {
@@ -354,10 +376,11 @@ add(a : word, b : word) : word asm {
 
 Placeholders:
 
-- `$out` — the block's **output** operand (constraint `=r`); the value the
-  block produces.
-- `$name` — an **input** operand (constraint `r`), loaded from the variable
-  or global `name`. Repeating a placeholder reuses the same operand.
+- `$out` — the block's **output** operand (constraint `=r` for integers,
+  `=x` for floats); the value the block produces.
+- `$name` — an **input** operand (constraint `r` for integers, `x` for
+  floats), loaded from the variable or global `name`. Repeating a placeholder
+  reuses the same operand.
 - `$$` — an escaped dollar, for literals that need one. AT&T immediates are
   written `$$42`:
 
@@ -400,7 +423,7 @@ define i32 @main() {
 }
 ```
 
-`main` cannot take parameters.
+`main` cannot take parameters, and cannot return `float` or `double` — use an integer type (or omit the annotation for `void`).
 
 ## Standard library
 
@@ -468,6 +491,7 @@ Each example is self-contained and covers a slice of the language.
 | [`examples/hello.hspl`](examples/hello.hspl) | Typed `extern`, a global, a call | `42` |
 | [`examples/words.hspl`](examples/words.hspl) | Zero-initialised globals, hex and two's-complement words | `0`, `-1`, `9223372036854775807`, `42` |
 | [`examples/asm.hspl`](examples/asm.hspl) | Asm inputs/outputs, `$$` immediates, explicit `$0`, word and byte operands | `42`, `42`, `-7`, `42`, `42` |
+| [`examples/floats.hspl`](examples/floats.hspl) | `float`/`double`, float literals, exact integer-to-float widening, float conditions, float asm operands | `1`, `1`, `0`, `1`, `1`, `1` (exit `0`) |
 | [`examples/scopes.hspl`](examples/scopes.hspl) | Typed `auto`, assignment, mutable globals, shadowing, widening at a call | `41`, `3`, `7`, `42`, `7` |
 | [`examples/functions.hspl`](examples/functions.hspl) | Empty statement, expression bodies, empty body, block bodies, nested calls and blocks, calling a function defined later | `7`, `0`, `42`, `9`, `42`, `42`, `42` |
 | [`examples/types.hspl`](examples/types.hspl) | Every primitive, defaults, literal ranges, `bool` literals, all widening conversions, typed asm, zero-valued blocks | `9223372036854775807`, `42`, `1000`, `-56`, `1`, `0`, `7`, `127`, `-128`, `-1`, `1`, `0`, `1`, `127`, `10`, `42`, `0` (exit `42`) |
@@ -593,6 +617,8 @@ llc /tmp/types.ll -o /tmp/types.s
 ## Roadmap
 
 - `while` and `for` sugar built on labels and jumps
+- Hexadecimal floating-point literals (`0x1.8p3`)
+- A `printdouble`-style symbol in the standard library (today `print` handles integers only)
 - Explicit casts, so narrowing can be written down
 - **More standard library**: `putchar`, word input, and allocation, all in
   assembly

@@ -19,7 +19,7 @@
 //!            | expression                                   // block-like, no ';'
 //!            | ';'
 //!
-//! expression := integer
+//! expression := integer | float
 //!             | 'true' | 'false'
 //!             | ident
 //!             | ident '(' [expression (',' expression)*] ')'
@@ -32,7 +32,7 @@
 //! `word`; a missing return-type annotation means `void`. There is no
 //! operator precedence table because there are no operators.
 
-use crate::ast::{Binding, Block, ExternDecl, Expr, Function, Global, Item, Program, Stmt, Type};
+use crate::ast::{Binding, Block, ExternDecl, Expr, Function, Global, Item, Literal, Program, Stmt, Type};
 use crate::lexer::{Token, TokenKind};
 
 /// Parse a token stream into a [`Program`].
@@ -133,7 +133,7 @@ impl Parser {
         let name = self.ident(context)?;
         Type::from_name(&name).ok_or_else(|| {
             format!(
-                "line {line}: unknown type `{name}` (expected word, int, short, byte, bool, or void)"
+                "line {line}: unknown type `{name}` (expected word, int, short, byte, bool, float, double, or void)"
             )
         })
     }
@@ -216,17 +216,21 @@ impl Parser {
             let init = match self.peek().clone() {
                 TokenKind::Int(value) => {
                     self.advance();
-                    value
+                    Literal::Int(value)
+                }
+                TokenKind::Float(value) => {
+                    self.advance();
+                    Literal::Float(value)
                 }
                 TokenKind::True => {
                     self.advance();
-                    1
+                    Literal::Int(1)
                 }
                 TokenKind::False => {
                     self.advance();
-                    0
+                    Literal::Int(0)
                 }
-                _ => 0,
+                _ => Literal::Int(0),
             };
             self.expect(&TokenKind::Semi, "after the global definition")?;
             Ok(Item::Global(Global { name, ty, init }))
@@ -336,6 +340,10 @@ impl Parser {
             TokenKind::Int(value) => {
                 self.advance();
                 Ok(Expr::Int(value))
+            }
+            TokenKind::Float(value) => {
+                self.advance();
+                Ok(Expr::Float(value))
             }
             TokenKind::True => {
                 self.advance();
@@ -554,22 +562,22 @@ mod tests {
                 Item::Global(Global {
                     name: "answer".into(),
                     ty: Type::Word,
-                    init: 42,
+                    init: Literal::Int(42),
                 }),
                 Item::Global(Global {
                     name: "zero".into(),
                     ty: Type::Byte,
-                    init: 0,
+                    init: Literal::Int(0),
                 }),
                 Item::Global(Global {
                     name: "counter".into(),
                     ty: Type::Int,
-                    init: 7,
+                    init: Literal::Int(7),
                 }),
                 Item::Global(Global {
                     name: "flag".into(),
                     ty: Type::Bool,
-                    init: 1,
+                    init: Literal::Int(1),
                 }),
             ]
         );
@@ -766,6 +774,51 @@ mod tests {
                 Stmt::Jump("end".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_float_literals_and_types() {
+        let program = parse_source("f() : double 1.5;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(function.ret, Type::Double);
+        assert_eq!(function.body, Stmt::Expr(Expr::Float(1.5)));
+    }
+
+    #[test]
+    fn parses_float_globals() {
+        let program = parse_source("pi : double 3.14159; plain : float; temp : double 2;");
+        assert_eq!(
+            program.items,
+            vec![
+                Item::Global(Global {
+                    name: "pi".into(),
+                    ty: Type::Double,
+                    init: Literal::Float(3.14159),
+                }),
+                Item::Global(Global {
+                    name: "plain".into(),
+                    ty: Type::Float,
+                    init: Literal::Int(0),
+                }),
+                Item::Global(Global {
+                    name: "temp".into(),
+                    ty: Type::Double,
+                    init: Literal::Int(2),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_float_extern_signatures() {
+        let program = parse_source("extern convert(float) : double;");
+        let Item::Extern(decl) = &program.items[0] else {
+            panic!("expected an extern");
+        };
+        assert_eq!(decl.params, vec![Type::Float]);
+        assert_eq!(decl.ret, Type::Double);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! HSPL: Hasan's Simple Programming Language.
 //!
-//! A small B-like language that compiles to LLVM IR. Values have one of six
-//! types: five value types (`word`, `int`, `short`, `byte`, `bool`) plus
+//! A small B-like language that compiles to LLVM IR. Values have one of eight
+//! types: five integer types (`word`, `int`, `short`, `byte`, `bool`), two
+//! IEEE-754 floating-point types (`float`, `double`), plus
 //! `void`, which is only valid as a function or `extern` return type and is
 //! the default when no return type is given. Types are
 //! written after names as in `f(x : int) : byte`. There are no operators and no

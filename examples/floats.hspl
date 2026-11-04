@@ -1,0 +1,53 @@
+// Floating-point types: `float` (32-bit) and `double` (64-bit).
+//
+// Literals adopt the expected type and are range-checked; a floating-point
+// literal defaults to `double`. Conversions are widening only: `float` widens
+// to `double`, and integers widen to a float type only when exactly
+// representable (`byte`/`short` to `float`, up to `int` to `double`). An
+// integer literal must also be exactly representable in a float context, and
+// a floating-point literal cannot be used in an integer context.
+//
+// Conditions accept floats: non-zero is true, and NaN is false. There are no
+// operators, so float arithmetic is done in inline assembly or in called
+// functions — see examples/asm.hspl for the operand rules. Assembly blocks
+// emit SSE registers (`x` constraint) for floating-point operands.
+
+extern print(word) : word;
+
+pi : double 3.14159;             // global with a floating-point literal
+ratio : float 1.5;              // float literal adopted as float
+zero_d : double;                // zero-initialised
+
+// A condition may be a float.
+classify(d : double) : word if d { 1 } else { 0 };
+
+// A short sign-extends into a double (exact for any short value).
+widen_short(s : short) : double {
+    auto d : double;
+    d = s;
+    d
+}
+
+// Passing a float where a double is expected widens it.
+identity_double(x : double) : double x;
+
+// Inline assembly with a floating-point operand.
+copy(x : double) : double asm {
+    movsd $x, $out
+}
+
+main() : word {
+    auto d : double;
+    auto f : float;
+
+    d = 1.5;                        // float literal adopted as double
+    f = 0.25;                       // float literal adopted as float
+
+    print(classify(d));             // 1
+    print(classify(f));             // 1 (float widens to double at the call)
+    print(classify(zero_d));        // 0
+    print(classify(widen_short(42)));   // 1
+    print(classify(identity_double(pi)));  // 1
+    print(classify(copy(pi)));      // 1
+    0
+}

@@ -1,13 +1,14 @@
 //! Abstract syntax tree for HSPL.
 //!
-//! HSPL has six primitive types. Annotations are written after names:
+//! HSPL has eight primitive types. Annotations are written after names:
 //! `function() : t`, `parameter : t`, `local : t`, `global : t`. A missing
 //! value-type annotation means [`Type::Word`]; a missing return-type
 //! annotation means [`Type::Void`]. `void` is only a return type.
 //!
-//! There are no operators. The only expressions are literals, variables, calls,
-//! inline assembly blocks, Rust-style statement expressions (blocks), and
-//! conditional expressions whose branches are expressions.
+//! There are no operators. The only expressions are literals (integer and
+//! floating-point), variables, calls, inline assembly blocks, Rust-style
+//! statement expressions (blocks), and conditional expressions whose branches
+//! are expressions.
 
 /// A primitive type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +26,10 @@ pub enum Type {
     Byte,
     /// Boolean, represented as `i1` in LLVM.
     Bool,
+    /// 32-bit IEEE-754 floating-point value.
+    Float,
+    /// 64-bit IEEE-754 floating-point value.
+    Double,
 }
 
 impl Type {
@@ -37,6 +42,8 @@ impl Type {
             Type::Short => "short",
             Type::Byte => "byte",
             Type::Bool => "bool",
+            Type::Float => "float",
+            Type::Double => "double",
         }
     }
 
@@ -49,6 +56,8 @@ impl Type {
             "short" => Some(Type::Short),
             "byte" => Some(Type::Byte),
             "bool" => Some(Type::Bool),
+            "float" => Some(Type::Float),
+            "double" => Some(Type::Double),
             _ => None,
         }
     }
@@ -62,6 +71,18 @@ impl Type {
             Type::Short => 16,
             Type::Byte => 8,
             Type::Bool => 1,
+            Type::Float => 32,
+            Type::Double => 64,
+        }
+    }
+
+    /// The number of mantissa bits of the floating-point types; `0` otherwise.
+    /// Every integer of at most this many bits is exactly representable.
+    pub fn mantissa_bits(self) -> u32 {
+        match self {
+            Type::Float => 24,
+            Type::Double => 53,
+            _ => 0,
         }
     }
 
@@ -75,14 +96,31 @@ impl Type {
         matches!(self, Type::Bool)
     }
 
+    /// Whether this is a floating-point type.
+    pub fn is_float(self) -> bool {
+        matches!(self, Type::Float | Type::Double)
+    }
+
     /// Whether a value of this type can be implicitly widened to `target`.
     ///
-    /// Widening is strictly by width: `bool` zero-extends, and every other
-    /// conversion sign-extends. Narrowing (or converting between types of the
-    /// same width) is not implicit. `void` is not a value type, so it never
-    /// participates in a conversion.
+    /// Widening is kind-aware. Integers widen strictly by width: `bool`
+    /// zero-extends, and every other integer widens with a sign-extension.
+    /// Floating-point types widen strictly by width (`float` → `double`).
+    /// An integer widens to a floating-point type exactly when every value of
+    /// the integer type is representable (at most `mantissa_bits` bits): the
+    /// narrower integers widen to `float`, and up to 32 bits widen to
+    /// `double`. A floating-point value never widens to an integer type, and
+    /// nothing narrows to anything implicitly.
     pub fn can_widen_to(self, target: Type) -> bool {
-        !self.is_void() && !target.is_void() && self.bits() < target.bits()
+        if self.is_void() || target.is_void() {
+            return false;
+        }
+        match (self.is_float(), target.is_float()) {
+            (true, true) => self.bits() < target.bits(),
+            (true, false) => false,
+            (false, true) => target.mantissa_bits() >= self.bits(),
+            (false, false) => self.bits() < target.bits(),
+        }
     }
 }
 
@@ -91,6 +129,17 @@ impl Type {
 pub struct Binding {
     pub name: String,
     pub ty: Type,
+}
+
+/// A literal initializer: `42`, `true`, `false`, or a floating-point literal
+/// such as `1.5`. Used for global definitions; [`Expr`] has its own literal
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Literal {
+    /// An integer literal, or `true`/`false` stored as `1`/`0`.
+    Int(i64),
+    /// A floating-point literal.
+    Float(f64),
 }
 
 /// A whole translation unit.
@@ -122,9 +171,9 @@ pub struct ExternDecl {
 pub struct Global {
     pub name: String,
     pub ty: Type,
-    /// Initializer as written. It is range-checked against `ty` during codegen
-    /// and defaults to zero when omitted.
-    pub init: i64,
+    /// Initializer as written. It is converted and range-checked against `ty`
+    /// during codegen and defaults to zero when omitted.
+    pub init: Literal,
 }
 
 /// A function definition.
@@ -171,6 +220,9 @@ pub struct Block {
 pub enum Expr {
     /// An integer literal; its type is taken from context and range-checked.
     Int(i64),
+    /// A floating-point literal; its type is taken from context (`float` or
+    /// `double`, defaulting to `double`) and range-checked.
+    Float(f64),
     /// `true` or `false`.
     Bool(bool),
     Var(String),
