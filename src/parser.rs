@@ -6,17 +6,19 @@
 //! program   := item*
 //! item      := 'extern' ident '(' [type (',' type)*] ')' [':' type] ';'  // import
 //!            | ident '(' [binding (',' binding)*] ')' [':' type] statement
+//!            | ident ':' type [ ('struct' | integer | 'true' | 'false') ]
 //!            | ident [':' type] [integer | 'true' | 'false'] ';'      // global
+//!            | ident ':' 'struct' '{' [ident ':' type (',' ident ':' type)*] '}' ';'
 //!
 //! binding   := ident [':' type]
 //!
 //! statement := 'auto' binding (',' binding)* ';'
-//!            | ident '=' expression ';'
-//!            | 'jump' ident ';'                             // goto
-//!            | ident ':'                                    // label
-//!            | 'label' ident [':'] ';'                      // label, keyword form
+//!            | path '=' expression ';'            // path is ident ('.' ident)*
+//!            | 'jump' ident ';'                   // goto
+//!            | ident ':'                          // label
+//!            | 'label' ident [':'] ';'            // label, keyword form
 //!            | expression ';'
-//!            | expression                                   // block-like, no ';'
+//!            | expression                          // block-like, no ';'
 //!            | ';'
 //!
 //! expression := integer | float
@@ -26,14 +28,28 @@
 //!             | asm '{' raw assembly '}'
 //!             | 'if' ['('] expression [')'] expression ['else' expression]
 //!             | '{' statement* [expression] '}'              // statement expression
+//!             | unary_op expression
+//!             | expression binary_op expression
+//!             | expression '.' ident                         // field access
 //! ```
 //!
+//! unary_op  := '-' | '~' | '&' | '*'
+//! binary_op := '|' | '^' | '&' | '<<' | '>>' | '+' | '-' | '*' | '/' | '%'
+//!
+//! Precedence, loosest to tightest: `|` < `^` < `&` < shifts < `+`/`-`
+//! < `*`/`/`/`%` < unary. Binary operators are left-associative.
+//!
 //! A missing value-type annotation (parameters, locals, globals) means
-//! `word`; a missing return-type annotation means `void`. There is no
-//! operator precedence table because there are no operators.
+//! `word`; a missing return-type annotation means `void`. There are no
+//! comparison or logical operators yet; arithmetic, bitwise, and reference
+//! operations are expressions.
 
-use crate::ast::{Binding, Block, ExternDecl, Expr, Function, Global, Item, Literal, Program, Stmt, Type};
+use crate::ast::{
+    Binding, Block, BinaryOp, ExternDecl, Expr, Function, Global, Item, Literal, Program, Stmt,
+    StructDecl, Type, UnaryOp,
+};
 use crate::lexer::{Token, TokenKind};
+use std::collections::HashMap;
 
 /// Parse a token stream into a [`Program`].
 pub fn parse(tokens: Vec<Token>) -> Result<Program, String> {
@@ -50,11 +66,19 @@ enum Parsed {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Struct declarations seen so far in this file, keyed by name. A struct
+    /// type may only be referenced with a declared name; bodies are never
+    /// written inline.
+    structs: HashMap<String, Vec<(String, Type)>>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            structs: HashMap::new(),
+        }
     }
 
     fn program(mut self) -> Result<Program, String> {
@@ -66,6 +90,40 @@ impl Parser {
     }
 
     // ----- token helpers -------------------------------------------------
+
+    /// Whether the upcoming tokens look like an assignment path:
+    /// `ident ('.' ident)* '='`.
+    fn at_assignment_path(&self) -> bool {
+        let mut index = self.pos;
+        if !matches!(self.tokens.get(index).map(|token| &token.kind), Some(TokenKind::Ident(_))) {
+            return false;
+        }
+        index += 1;
+        loop {
+            match self.tokens.get(index).map(|token| &token.kind) {
+                Some(TokenKind::Dot) => {
+                    index += 1;
+                    match self.tokens.get(index).map(|token| &token.kind) {
+                        Some(TokenKind::Ident(_)) => index += 1,
+                        _ => return false,
+                    }
+                }
+                Some(TokenKind::Assign) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Parse `ident ('.' ident)*` and return the components joined with `.`.
+    fn assignment_path(&mut self) -> Result<String, String> {
+        let mut path = self.ident("in an assignment")?;
+        while self.eat(&TokenKind::Dot) {
+            let field = self.ident("after `.`")?;
+            path.push('.');
+            path.push_str(&field);
+        }
+        Ok(path)
+    }
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
@@ -131,11 +189,20 @@ impl Parser {
     fn ty(&mut self, context: &str) -> Result<Type, String> {
         let line = self.line();
         let name = self.ident(context)?;
-        Type::from_name(&name).ok_or_else(|| {
-            format!(
-                "line {line}: unknown type `{name}` (expected word, int, short, byte, bool, float, double, or void)"
-            )
-        })
+        if let Some(ty) = Type::from_name(&name) {
+            return Ok(ty);
+        }
+        if name == "struct" {
+            return Err(format!(
+                "line {line}: `struct` is not a type on its own; structs are declared at the top level as `name : struct {{ ... }};`"
+            ));
+        }
+        if let Some(fields) = self.structs.get(&name) {
+            return Ok(Type::Struct { name, fields: fields.clone() });
+        }
+        Err(format!(
+            "line {line}: unknown type `{name}` (expected word, int, short, byte, bool, float, double, void, or a declared struct)"
+        ))
     }
 
     /// Parse an optional `: type` in a value position (parameters, locals,
@@ -212,6 +279,76 @@ impl Parser {
                 body,
             }))
         } else {
+            // `name : struct { field : type, ... };` — a struct type
+            // declaration. Structs are named, never anonymous, and never
+            // declared inline.
+            if self.check(&TokenKind::Colon)
+                && matches!(self.peek_at(1), TokenKind::Ident(name) if name == "struct")
+            {
+                self.advance(); // `:`
+                self.advance(); // `struct`
+                self.expect(&TokenKind::LBrace, "to open the struct body")?;
+
+                let mut fields = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                if !self.check(&TokenKind::RBrace) {
+                    loop {
+                        let field = self.binding("for a field name")?;
+                        if !seen.insert(field.name.clone()) {
+                            return Err(format!(
+                                "line {}: struct `{name}` has a duplicate field `{}`",
+                                self.line(),
+                                field.name
+                            ));
+                        }
+                        if field.ty.is_void() {
+                            return Err(format!(
+                                "line {}: field `{}` of struct `{name}` cannot have type `void`",
+                                self.line(),
+                                field.name
+                            ));
+                        }
+                        fields.push(field);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                        // A trailing comma before `}` is allowed.
+                        if self.check(&TokenKind::RBrace) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RBrace, "to close the struct body")?;
+
+                if fields.is_empty() {
+                    return Err(format!(
+                        "line {}: struct `{name}` has no fields",
+                        self.line()
+                    ));
+                }
+                if Type::from_name(&name).is_some() || name == "print" {
+                    return Err(format!(
+                        "line {}: struct `{name}` cannot use a reserved or builtin type name",
+                        self.line()
+                    ));
+                }
+                if self.structs.contains_key(&name) {
+                    return Err(format!(
+                        "line {}: struct `{name}` is defined more than once",
+                        self.line()
+                    ));
+                }
+
+                self.expect(&TokenKind::Semi, "after the struct definition")?;
+
+                let field_types: Vec<(String, Type)> = fields
+                    .iter()
+                    .map(|field| (field.name.clone(), field.ty.clone()))
+                    .collect();
+                self.structs.insert(name.clone(), field_types);
+                return Ok(Item::StructDecl(StructDecl { name, fields }));
+            }
+
             let ty = self.optional_type()?;
             let init = match self.peek().clone() {
                 TokenKind::Int(value) => {
@@ -284,12 +421,15 @@ impl Parser {
                 self.expect(&TokenKind::Colon, "after a label name")?;
                 Ok(Parsed::Stmt(Stmt::Label(name)))
             }
-            TokenKind::Ident(_) if matches!(self.peek_at(1), TokenKind::Assign) => {
-                let name = self.ident("in an assignment")?;
+            // `path = expression;` — assignment, where the path is one or
+            // more identifiers separated by `.` (a variable or a chain of
+            // struct fields, e.g. `p.x = 5;`).
+            TokenKind::Ident(_) if self.at_assignment_path() => {
+                let path = self.assignment_path()?;
                 self.expect(&TokenKind::Assign, "in an assignment")?;
                 let value = self.expr()?;
                 self.expect(&TokenKind::Semi, "after the assigned value")?;
-                Ok(Parsed::Stmt(Stmt::Assign(name, value)))
+                Ok(Parsed::Stmt(Stmt::Assign(path, value)))
             }
             _ => {
                 let expr = self.expr()?;
@@ -335,7 +475,109 @@ impl Parser {
 
     // ----- expressions ---------------------------------------------------
 
+    /// Parse a full expression: a sequence of binary operations, resolved by
+    /// precedence climbing (the loosest level first).
     fn expr(&mut self) -> Result<Expr, String> {
+        self.binary_expr(0)
+    }
+
+    /// Parse an expression of at least `min_precedence`. Precedence climbing:
+    /// operands looser than the running minimum terminate the loop, which is
+    /// what builds the precedence table without a flat list of levels.
+    fn binary_expr(&mut self, min_precedence: u8) -> Result<Expr, String> {
+        let mut lhs = self.unary_expr()?;
+
+        while let Some((precedence, op)) = self.binary_operator()? {
+            if precedence < min_precedence {
+                break;
+            }
+            self.advance();
+            // Left-associative: the right operand parses at `precedence + 1`.
+            let rhs = self.binary_expr(precedence + 1)?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(lhs)
+    }
+
+    /// The next infix operator, if any, with its precedence (lower binds
+    /// looser).
+    fn binary_operator(&mut self) -> Result<Option<(u8, BinaryOp)>, String> {
+        let (precedence, op) = match self.peek().clone() {
+            TokenKind::Pipe => (1, BinaryOp::Or),
+            TokenKind::Caret => (2, BinaryOp::Xor),
+            TokenKind::Amp => (3, BinaryOp::And),
+            TokenKind::LShift => (4, BinaryOp::Shl),
+            TokenKind::RShift => (4, BinaryOp::Shr),
+            TokenKind::Plus => (5, BinaryOp::Add),
+            TokenKind::Minus => (5, BinaryOp::Sub),
+            TokenKind::Star => (6, BinaryOp::Mul),
+            TokenKind::Slash => (6, BinaryOp::Div),
+            TokenKind::Percent => (6, BinaryOp::Rem),
+            _ => return Ok(None),
+        };
+        Ok(Some((precedence, op)))
+    }
+
+    /// Parse a prefix (unary) expression: `-`, `~`, `&` or `*`, applied to
+    /// the unary expression that follows.
+    fn unary_expr(&mut self) -> Result<Expr, String> {
+        match self.peek().clone() {
+            TokenKind::Minus => {
+                self.advance();
+                let operand = self.unary_expr()?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                })
+            }
+            TokenKind::Tilde => {
+                self.advance();
+                let operand = self.unary_expr()?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::BitNot,
+                    operand: Box::new(operand),
+                })
+            }
+            TokenKind::Amp => {
+                self.advance();
+                let operand = self.unary_expr()?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Ref,
+                    operand: Box::new(operand),
+                })
+            }
+            TokenKind::Star => {
+                self.advance();
+                let operand = self.unary_expr()?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Deref,
+                    operand: Box::new(operand),
+                })
+            }
+            _ => self.postfix(),
+        }
+    }
+
+    /// Parse a primary expression followed by zero or more `.field` suffixes,
+    /// e.g. `p.x`, `p.inner.y`, or `f().x`.
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut expr = self.primary()?;
+        while self.eat(&TokenKind::Dot) {
+            let field = self.ident("after `.`")?;
+            expr = Expr::Field {
+                base: Box::new(expr),
+                field,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             TokenKind::Int(value) => {
                 self.advance();
@@ -832,5 +1074,283 @@ mod tests {
         };
         assert_eq!(block.stmts, vec![Stmt::Label("done".into())]);
         assert_eq!(block.tail.as_deref(), Some(&Expr::Int(7)));
+    }
+
+    #[test]
+    fn parses_binary_operations() {
+        let program = parse_source("f(a : word, b : word) : word a - b;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(
+            function.body,
+            Stmt::Expr(Expr::Binary {
+                op: BinaryOp::Sub,
+                lhs: Box::new(Expr::Var("a".into())),
+                rhs: Box::new(Expr::Var("b".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_unary_operations() {
+        let program = parse_source("f(x : word) : word -x;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(
+            function.body,
+            Stmt::Expr(Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(Expr::Var("x".into())),
+            })
+        );
+
+        let program = parse_source("f(x : word) : word ~x;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(
+            function.body,
+            Stmt::Expr(Expr::Unary {
+                op: UnaryOp::BitNot,
+                operand: Box::new(Expr::Var("x".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_left_associative_binary_operations() {
+        // `a - b - c` is `(a - b) - c`.
+        let program = parse_source("f(a : word, b : word, c : word) : word a - b - c;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(
+            function.body,
+            Stmt::Expr(Expr::Binary {
+                op: BinaryOp::Sub,
+                lhs: Box::new(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: Box::new(Expr::Var("a".into())),
+                    rhs: Box::new(Expr::Var("b".into())),
+                }),
+                rhs: Box::new(Expr::Var("c".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_precedence_of_binary_operations() {
+        // `a + b * c` is `a + (b * c)`.
+        let program = parse_source("f(a : word, b : word, c : word) : word a + b * c;");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(
+            function.body,
+            Stmt::Expr(Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(Expr::Var("a".into())),
+                rhs: Box::new(Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(Expr::Var("b".into())),
+                    rhs: Box::new(Expr::Var("c".into())),
+                }),
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod struct_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+
+    fn parse_source(source: &str) -> Program {
+        parse(tokenize(source).expect("tokenizes")).expect("parses")
+    }
+
+    #[test]
+    fn types_have_eight_primitives_plus_named_structs() {
+        let program = parse_source("point : struct { x : word, y : word };");
+        let Item::StructDecl(decl) = &program.items[0] else {
+            panic!("expected a struct declaration");
+        };
+        assert_eq!(decl.name, "point");
+        assert_eq!(
+            decl.fields,
+            vec![
+                Binding { name: "x".into(), ty: Type::Word },
+                Binding { name: "y".into(), ty: Type::Word },
+            ]
+        );
+    }
+
+    #[test]
+    fn struct_fields_can_be_of_any_declared_type() {
+        let program = parse_source(
+            "point : struct { x : word, y : word };\n\
+             offset : struct { base : point, dx : word, on : bool, temp : float };",
+        );
+        let Item::StructDecl(decl) = &program.items[1] else {
+            panic!("expected a struct declaration");
+        };
+        assert_eq!(
+            decl.fields,
+            vec![
+                Binding { name: "base".into(), ty: Type::Struct {
+                    name: "point".into(),
+                    fields: vec![
+                        ("x".into(), Type::Word),
+                        ("y".into(), Type::Word),
+                    ],
+                } },
+                Binding { name: "dx".into(), ty: Type::Word },
+                Binding { name: "on".into(), ty: Type::Bool },
+                Binding { name: "temp".into(), ty: Type::Float },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_struct_name_is_rejected() {
+        let error = parse(tokenize("f() : point { auto p : point; p }").unwrap()).unwrap_err();
+        assert!(error.contains("unknown type `point`"), "{error}");
+    }
+
+    #[test]
+    fn a_struct_field_cannot_reference_a_later_struct() {
+        let error = parse(tokenize(
+            "outer : struct { inner : inner };\ninner : struct { n : word };",
+        ).unwrap()).unwrap_err();
+        assert!(error.contains("unknown type `inner`"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_reject_duplicate_fields() {
+        let error = parse(tokenize("point : struct { x : word, x : word };").unwrap()).unwrap_err();
+        assert!(error.contains("duplicate field `x`"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_reject_empty_bodies() {
+        let error = parse(tokenize("point : struct { };").unwrap()).unwrap_err();
+        assert!(error.contains("has no fields"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_reject_void_fields() {
+        let error = parse(tokenize("point : struct { x : void };").unwrap()).unwrap_err();
+        assert!(error.contains("cannot have type `void`"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_cannot_use_builtin_type_names() {
+        let error = parse(tokenize("word : struct { x : word };").unwrap()).unwrap_err();
+        assert!(error.contains("builtin type name"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_cannot_be_named_print() {
+        let error = parse(tokenize("print : struct { x : word };").unwrap()).unwrap_err();
+        assert!(error.contains("standard library") || error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_struct_declarations_are_rejected() {
+        let error = parse(tokenize(
+            "point : struct { x : word };\npoint : struct { y : word };",
+        ).unwrap()).unwrap_err();
+        assert!(error.contains("defined more than once"), "{error}");
+    }
+
+    #[test]
+    fn struct_declarations_are_never_anonymous() {
+        // A name is always required for a struct type.
+        let error = parse(tokenize("main() : word { auto p : struct { x : word }; 0 }").unwrap()).unwrap_err();
+        assert!(error.contains("`struct` is not a type on its own"), "{error}");
+    }
+
+    #[test]
+    fn field_access_parses_as_nested_field_expressions() {
+        let program = parse_source(
+            "namespace : struct { dx : word };\n\
+             point : struct { inner : namespace, n : word };\n\
+             main() : word { auto p : point; p.inner.dx }",
+        );
+        let Item::Function(function) = &program.items[2] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Block(block)) = &function.body else {
+            panic!("expected a block body");
+        };
+        let Some(Expr::Field { base, field }) = block.tail.as_deref() else {
+            panic!("expected a field access, found {block:?}");
+        };
+        assert_eq!(field, "dx");
+        let Expr::Field { base, field } = base.as_ref() else {
+            panic!("expected a nested field access");
+        };
+        assert_eq!(field, "inner");
+        assert!(matches!(base.as_ref(), Expr::Var(name) if name == "p"));
+    }
+
+    #[test]
+    fn assignment_paths_parse_with_dotted_names() {
+        let program = parse_source(
+            "point : struct { x : word };\nmain() : word { auto p : point; p.x = 5; p.x }",
+        );
+        let Item::Function(function) = &program.items[1] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Block(block)) = &function.body else {
+            panic!("expected a block body");
+        };
+        match &block.stmts[1] {
+            Stmt::Assign(path, Expr::Int(5)) => assert_eq!(path, "p.x"),
+            other => panic!("expected an assignment to `p.x`, found {other:?}"),
+        }
+        match &block.tail.as_deref() {
+            Some(Expr::Field { base, field }) => {
+                assert!(matches!(base.as_ref(), Expr::Var(name) if name == "p"));
+                assert_eq!(field, "x");
+            }
+            other => panic!("expected a field access, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_variables_still_parse_as_assignment_paths() {
+        let program = parse_source("main() : word { auto v; v = 3; v }");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Block(block)) = &function.body else {
+            panic!("expected a block body");
+        };
+        match &block.stmts[1] {
+            Stmt::Assign(name, Expr::Int(3)) => assert_eq!(name, "v"),
+            other => panic!("expected assignment to `v`, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_works_on_calls_and_groups_too() {
+        // `p.inner.x` chains through any primary, not just variables.
+        let program = parse_source(
+            "point : struct { x : word };\nidentity(p : point) : point p;\nmain() : word { auto p : point; identity(p).x }",
+        );
+        let Item::Function(function) = &program.items[2] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Block(block)) = &function.body else {
+            panic!("expected a block body");
+        };
+        let Some(Expr::Field { base, field }) = block.tail.as_deref() else {
+            panic!("expected a field access, found {block:?}");
+        };
+        assert_eq!(field, "x");
+        assert!(matches!(base.as_ref(), Expr::Call(name, _) if name == "identity"));
     }
 }

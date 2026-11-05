@@ -1,17 +1,24 @@
 //! Abstract syntax tree for HSPL.
 //!
-//! HSPL has eight primitive types. Annotations are written after names:
+//! Programs have nine types: eight primitive types plus named struct types.
+//! Annotations are written after names:
 //! `function() : t`, `parameter : t`, `local : t`, `global : t`. A missing
 //! value-type annotation means [`Type::Word`]; a missing return-type
 //! annotation means [`Type::Void`]. `void` is only a return type.
 //!
-//! There are no operators. The only expressions are literals (integer and
-//! floating-point), variables, calls, inline assembly blocks, Rust-style
-//! statement expressions (blocks), and conditional expressions whose branches
-//! are expressions.
+//! Structs are named, never anonymous, never declared inline, and there are
+//! no generics or `impl` blocks. Structs are declared at the top level:
+//! `point : struct { x : word, y : word };`. Values of a struct type are
+//! created by declaring a variable or global of that type (zero-initialised)
+//! and then assigning fields with dotted paths (`p.x = 5;`). Field access uses
+//! postfix `.` (`p.x`). There are no operators yet for everything that is not
+//! an arithmetic, bitwise, or reference operation: comparisons, logical
+//! operators, and casts are still to come. Arithmetic (`+ - * / %`), bitwise
+//! (`& | ^ ~ << >>`) and reference (`&` address-of, `*`) operations are
+//! expressions.
 
-/// A primitive type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A primitive type, or a named struct type with typed fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// No value. The default return type; usable only as a function or
     /// `extern` return type.
@@ -30,24 +37,36 @@ pub enum Type {
     Float,
     /// 64-bit IEEE-754 floating-point value.
     Double,
+    /// A named struct type with typed fields, such as `point` with fields
+    /// `x : word` and `y : word`. Structs are named and never anonymous; there
+    /// are no generics and no `impl` blocks.
+    Struct {
+        /// The name of the struct type.
+        name: String,
+        /// The fields, in order, each with its own type.
+        fields: Vec<(String, Type)>,
+    },
 }
 
 impl Type {
-    /// The source spelling of this type.
-    pub fn name(self) -> &'static str {
+    /// The source spelling of this type. Struct types keep their name.
+    pub fn name(&self) -> String {
         match self {
-            Type::Void => "void",
-            Type::Word => "word",
-            Type::Int => "int",
-            Type::Short => "short",
-            Type::Byte => "byte",
-            Type::Bool => "bool",
-            Type::Float => "float",
-            Type::Double => "double",
+            Type::Void => "void".to_string(),
+            Type::Word => "word".to_string(),
+            Type::Int => "int".to_string(),
+            Type::Short => "short".to_string(),
+            Type::Byte => "byte".to_string(),
+            Type::Bool => "bool".to_string(),
+            Type::Float => "float".to_string(),
+            Type::Double => "double".to_string(),
+            Type::Struct { name, .. } => name.clone(),
         }
     }
 
-    /// Look up a type by its source spelling.
+    /// Look up a primitive type by its source spelling. Struct types are
+    /// resolved by the parser from its registry of declared structs; a bare
+    /// `struct { ... }` is never a type (structs are never anonymous).
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "void" => Some(Type::Void),
@@ -63,9 +82,10 @@ impl Type {
     }
 
     /// The width of this type in bits. `void` has no representation, so it is 0.
-    pub fn bits(self) -> u32 {
+    /// Struct types are aggregates, so they are 0 as well.
+    pub fn bits(&self) -> u32 {
         match self {
-            Type::Void => 0,
+            Type::Void | Type::Struct { .. } => 0,
             Type::Word => 64,
             Type::Int => 32,
             Type::Short => 16,
@@ -78,7 +98,7 @@ impl Type {
 
     /// The number of mantissa bits of the floating-point types; `0` otherwise.
     /// Every integer of at most this many bits is exactly representable.
-    pub fn mantissa_bits(self) -> u32 {
+    pub fn mantissa_bits(&self) -> u32 {
         match self {
             Type::Float => 24,
             Type::Double => 53,
@@ -87,18 +107,23 @@ impl Type {
     }
 
     /// Whether this is the void type.
-    pub fn is_void(self) -> bool {
+    pub fn is_void(&self) -> bool {
         matches!(self, Type::Void)
     }
 
     /// Whether this is the boolean type.
-    pub fn is_bool(self) -> bool {
+    pub fn is_bool(&self) -> bool {
         matches!(self, Type::Bool)
     }
 
     /// Whether this is a floating-point type.
-    pub fn is_float(self) -> bool {
+    pub fn is_float(&self) -> bool {
         matches!(self, Type::Float | Type::Double)
+    }
+
+    /// Whether this is a named struct type.
+    pub fn is_struct(&self) -> bool {
+        matches!(self, Type::Struct { .. })
     }
 
     /// Whether a value of this type can be implicitly widened to `target`.
@@ -110,9 +135,9 @@ impl Type {
     /// the integer type is representable (at most `mantissa_bits` bits): the
     /// narrower integers widen to `float`, and up to 32 bits widen to
     /// `double`. A floating-point value never widens to an integer type, and
-    /// nothing narrows to anything implicitly.
-    pub fn can_widen_to(self, target: Type) -> bool {
-        if self.is_void() || target.is_void() {
+    /// nothing narrows to anything implicitly. Struct values never widen.
+    pub fn can_widen_to(&self, target: &Type) -> bool {
+        if self.is_void() || target.is_void() || self.is_struct() || target.is_struct() {
             return false;
         }
         match (self.is_float(), target.is_float()) {
@@ -142,6 +167,44 @@ pub enum Literal {
     Float(f64),
 }
 
+/// A unary operation: negation, bitwise not, address-of, or dereference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// Unary minus (`-x`).
+    Neg,
+    /// Unary bitwise not (`~x`).
+    BitNot,
+    /// Address-of (`&x`), which yields a `word` holding the address.
+    Ref,
+    /// Dereference (`*x`), which loads through an address held in a `word`.
+    Deref,
+}
+
+/// A binary operation: an arithmetic or bitwise combination of two operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// Addition (`+`).
+    Add,
+    /// Subtraction (`-`).
+    Sub,
+    /// Multiplication (`*`).
+    Mul,
+    /// Division (`/`).
+    Div,
+    /// Remainder (`%`).
+    Rem,
+    /// Bitwise AND (`&`).
+    And,
+    /// Bitwise OR (`|`).
+    Or,
+    /// Bitwise XOR (`^`).
+    Xor,
+    /// Left shift (`<<`).
+    Shl,
+    /// Right shift (`>>`).
+    Shr,
+}
+
 /// A whole translation unit.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Program {
@@ -155,6 +218,16 @@ pub enum Item {
     Extern(ExternDecl),
     Global(Global),
     Function(Function),
+    /// `point : struct { x : word, y : word };` — a struct type declaration.
+    /// Structs are named and never anonymous.
+    StructDecl(StructDecl),
+}
+
+/// A struct type declaration: a name and its fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<Binding>,
 }
 
 /// An imported function's signature. Parameter names are not part of an extern
@@ -215,7 +288,9 @@ pub struct Block {
     pub tail: Option<Box<Expr>>,
 }
 
-/// An expression. Note the complete absence of operator nodes.
+/// An expression. Operator nodes wrap operands: [`Expr::Unary`] for prefix
+/// operations (negate, bitwise not, address-of, dereference) and
+/// [`Expr::Binary`] for infix operations (arithmetic and bitwise combinations).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// An integer literal; its type is taken from context and range-checked.
@@ -227,8 +302,26 @@ pub enum Expr {
     Bool(bool),
     Var(String),
     Call(String, Vec<Expr>),
+    /// `point.x` — access to the field `x` of the value in `base`. The base
+    /// must be a variable or another field access (an addressable value).
+    Field {
+        base: Box<Expr>,
+        field: String,
+    },
     /// Raw assembly body from an `asm { ... }` block.
     Asm(String),
+    /// A unary operation such as negation, bitwise not, address-of, or
+    /// dereference.
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+    /// A binary operation such as an arithmetic or bitwise combination.
+    Binary {
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// A nested statement expression.
     Block(Block),
     /// `if condition expression else expression` — an expression yielding the

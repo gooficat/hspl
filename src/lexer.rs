@@ -1,8 +1,10 @@
 //! Tokenizer for HSPL.
 //!
-//! The language has no operators, so the token set is deliberately small. An
-//! `asm { ... }` block is captured as a single [`TokenKind::Asm`] token because
-//! its contents are raw target assembly, not HSPL tokens.
+//! The language started out with no operators; it now has a small,
+//! C-like operator set (`+ - * / % & | ^ ~ << >>`, plus unary `- ~ & *`).
+//! The token set is otherwise deliberately small. An `asm { ... }`
+//! block is captured as a single [`TokenKind::Asm`] token because its
+//! contents are raw target assembly, not HSPL tokens.
 
 use std::fmt;
 
@@ -30,6 +32,18 @@ pub enum TokenKind {
     Colon,
     Semi,
     Assign,
+    Dot,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    LShift,
+    RShift,
     Eof,
 }
 
@@ -56,6 +70,18 @@ impl fmt::Display for TokenKind {
             TokenKind::Colon => write!(f, "`:`"),
             TokenKind::Semi => write!(f, "`;`"),
             TokenKind::Assign => write!(f, "`=`"),
+            TokenKind::Dot => write!(f, "."),
+            TokenKind::Plus => write!(f, "`+`"),
+            TokenKind::Minus => write!(f, "`-`"),
+            TokenKind::Star => write!(f, "`*`"),
+            TokenKind::Slash => write!(f, "`/`"),
+            TokenKind::Percent => write!(f, "`%`"),
+            TokenKind::Amp => write!(f, "`&`"),
+            TokenKind::Pipe => write!(f, "`|`"),
+            TokenKind::Caret => write!(f, "`^`"),
+            TokenKind::Tilde => write!(f, "`~`"),
+            TokenKind::LShift => write!(f, "`<<`"),
+            TokenKind::RShift => write!(f, "`>>`"),
             TokenKind::Eof => write!(f, "end of file"),
         }
     }
@@ -359,9 +385,39 @@ impl Lexer {
             Some(':') => TokenKind::Colon,
             Some(';') => TokenKind::Semi,
             Some('=') => TokenKind::Assign,
+            Some('.') => TokenKind::Dot,
+            Some('+') => TokenKind::Plus,
+            Some('-') => TokenKind::Minus,
+            Some('*') => TokenKind::Star,
+            Some('/') => TokenKind::Slash,
+            Some('%') => TokenKind::Percent,
+            Some('&') => TokenKind::Amp,
+            Some('|') => TokenKind::Pipe,
+            Some('^') => TokenKind::Caret,
+            Some('~') => TokenKind::Tilde,
+            Some('<') => {
+                if self.peek() == Some('<') {
+                    self.bump();
+                    TokenKind::LShift
+                } else {
+                    return Err(format!(
+                        "line {line}: unexpected character `<` (only the supported operators are `+ - * / % & | ^ ~ << >>`)"
+                    ));
+                }
+            }
+            Some('>') => {
+                if self.peek() == Some('>') {
+                    self.bump();
+                    TokenKind::RShift
+                } else {
+                    return Err(format!(
+                        "line {line}: unexpected character `>` (only the supported operators are `+ - * / % & | ^ ~ << >>`)"
+                    ));
+                }
+            }
             Some(c) => {
                 return Err(format!(
-                    "line {line}: unexpected character `{c}` (HSPL has no operators)"
+                    "line {line}: unexpected character `{c}` (only the supported operators are `+ - * / % & | ^ ~ << >>`)"
                 ));
             }
             None => TokenKind::Eof,
@@ -489,9 +545,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_operators() {
-        let error = tokenize("x = 1 + 2;").unwrap_err();
-        assert!(error.contains("no operators"), "{error}");
+    fn rejects_unsupported_characters() {
+        let error = tokenize("x = 1 @ 2;").unwrap_err();
+        assert!(error.contains("unexpected character"), "{error}");
+        let error = tokenize("x = 1 < 2;").unwrap_err();
+        assert!(error.contains("unexpected character"), "{error}");
+    }
+
+    #[test]
+    fn tokenizes_arithmetic_operators() {
+        assert_eq!(
+            kinds("a + b - c * d / e % f;"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Plus,
+                TokenKind::Ident("b".into()),
+                TokenKind::Minus,
+                TokenKind::Ident("c".into()),
+                TokenKind::Star,
+                TokenKind::Ident("d".into()),
+                TokenKind::Slash,
+                TokenKind::Ident("e".into()),
+                TokenKind::Percent,
+                TokenKind::Ident("f".into()),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_bitwise_and_shift_operators() {
+        assert_eq!(
+            kinds("a & b | c ^ d ~ e << f >> g"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Amp,
+                TokenKind::Ident("b".into()),
+                TokenKind::Pipe,
+                TokenKind::Ident("c".into()),
+                TokenKind::Caret,
+                TokenKind::Ident("d".into()),
+                TokenKind::Tilde,
+                TokenKind::Ident("e".into()),
+                TokenKind::LShift,
+                TokenKind::Ident("f".into()),
+                TokenKind::RShift,
+                TokenKind::Ident("g".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_unary_prefix_operators() {
+        assert_eq!(
+            kinds("-x ~y &z *w"),
+            vec![
+                TokenKind::Minus,
+                TokenKind::Ident("x".into()),
+                TokenKind::Tilde,
+                TokenKind::Ident("y".into()),
+                TokenKind::Amp,
+                TokenKind::Ident("z".into()),
+                TokenKind::Star,
+                TokenKind::Ident("w".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

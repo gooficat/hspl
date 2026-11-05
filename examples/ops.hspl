@@ -1,0 +1,58 @@
+// Operators: arithmetic, bitwise, and reference operations.
+//
+//   + - * / %    arithmetic    (`word`, `int`, `short`, `byte`, `float`, `double`)
+//   & | ^ ~      bitwise       (`word`, `int`, `short`, `byte`)
+//   << >>        shifts         (`word`, `int`, `short`, `byte`)
+//   - ~          unary          (`word`, `int`, `short`, `byte`, `float`, `double`)
+//   &x  *x       reference      (`word`)
+//
+// There are no comparison or logical operators yet.
+
+extern print(word) : word;
+
+answer : word 42;
+
+sum(a : word, b : word) : word a + b;
+diff(a : word, b : word) : word a - b;
+product(a : word, b : word) : word a * b;
+quotient(a : word, b : word) : word a / b;
+remainder(a : word, b : word) : word a % b;
+
+bitwise_and(a : word, b : word) : word a & b;
+bitwise_or(a : word, b : word) : word a | b;
+bitwise_xor(a : word, b : word) : word a ^ b;
+bitwise_not(a : word) : word ~a;
+shift_left(a : word, b : word) : word a << b;
+shift_right(a : word, b : word) : word a >> b;
+
+negate(x : word) : word -x;
+
+// `&x` takes the address of a `word` and yields the address as a `word`;
+// `*p` loads through that address and yields the referenced value.
+deref(x : word) : word *&x;
+
+add_bytes(a : byte, b : byte) : byte a + b;
+mul_short(a : short, b : short) : short a * b;
+
+main() : word {
+    auto slot : word;
+    slot = &answer;
+    print(*slot);               // 42
+
+    print(sum(20, 22));      // 42
+    print(diff(100, 10));    // 90
+    print(product(6, 7));    // 42
+    print(quotient(21, 2));  // 10
+    print(remainder(21, 2)); // 1
+    print(bitwise_and(12, 10));    // 8
+    print(bitwise_or(12, 10));     // 14
+    print(bitwise_xor(12, 10));    // 6
+    print(bitwise_not(0));         // -1
+    print(shift_left(3, 4));      // 48
+    print(shift_right(0xFF, 2));   // 63
+    print(negate(5));              // -5
+    print(deref(7));               // 7
+    print(add_bytes(2, 3));      // 5 (byte)
+    print(mul_short(6, 7));      // 42 (short)
+    0
+}

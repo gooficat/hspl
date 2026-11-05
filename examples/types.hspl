@@ -28,8 +28,9 @@ t : bool true;
 f : bool false;
 plain 7;
 
-// Literals adopt the annotation's type. There are no unary operators, so
-// negative values are written in two's-complement hex.
+// Literals adopt the annotation's type. There are no unary operators for
+// narrowing types yet, so negative values are usually written in two's-complement
+// hex, and narrowing arithmetic is not available yet.
 small() : byte 127;
 negative() : byte 0x80;       // -128 as an 8-bit value
 minus_one_i32() : int 0xFFFFFFFF;

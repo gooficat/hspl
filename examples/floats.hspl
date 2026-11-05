@@ -8,9 +8,10 @@
 // a floating-point literal cannot be used in an integer context.
 //
 // Conditions accept floats: non-zero is true, and NaN is false. There are no
-// operators, so float arithmetic is done in inline assembly or in called
-// functions — see examples/asm.hspl for the operand rules. Assembly blocks
-// emit SSE registers (`x` constraint) for floating-point operands.
+// comparison operators yet, so float arithmetic happens through the `+ - * /
+// %` operators or in inline assembly or in called functions — see
+// examples/asm.hspl for the operand rules. Assembly blocks emit SSE registers
+// (`x` constraint) for floating-point operands.
 
 extern print(word) : word;
 

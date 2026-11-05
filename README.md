@@ -3,11 +3,12 @@
 [![CI](https://github.com/gooficat/hspl/actions/workflows/ci.yml/badge.svg)](https://github.com/gooficat/hspl/actions/workflows/ci.yml)
 
 **Hasan's Simple Programming Language** — a small, B-like systems language
-that compiles to LLVM IR. HSPL has eight primitive types, no operators, and no
-`return` statements: arithmetic is done in inline assembly, control flow is an
-`if` expression plus labels and `jump`, and every function body is exactly one
-statement whose value is the function's result. Programs link against a tiny
-assembly standard library and produce native executables.
+that compiles to LLVM IR. HSPL has eight primitive types plus named struct
+types, a small C-like operator set (arithmetic, bitwise, and reference
+operators), control flow via `if` expressions and labels, and no `return`
+statements: every function body is exactly one statement whose value is the
+function's result. Programs link against a tiny assembly standard library and
+produce native executables.
 
 ```hspl
 extern print(word) : word;
@@ -30,7 +31,7 @@ $ ./a.out
 - [The language](#the-language)
   - [Program structure](#program-structure)
   - [Types and conversions](#types-and-conversions)
-  - [Items: `extern`, globals, and functions](#items-extern-globals-and-functions)
+  - [Items: externs, globals, functions, structs](#items-externs-globals-functions-structs)
   - [Statements](#statements)
   - [Expressions](#expressions)
   - [Statement expressions](#statement-expressions)
@@ -88,9 +89,17 @@ known output; [the examples table](#examples) lists what each one covers.
 
 HSPL is deliberately stripped down, in the spirit of B:
 
-- **No operators.** `+`, `-`, `*`, `/`, `%`, comparisons, `&&`, `||`, and `!`
-  are lexer errors. Assignment is a statement, not an expression. Real
-  arithmetic happens in inline assembly or in called functions.
+- **No comparison or logical operators.** Comparisons (`==`, `<`, ...), the
+  logical operators (`&&`, `||`, `!`) and casts are not part of the language
+  yet. Assignment is a statement, not an expression. Arithmetic
+  (`+ - * / %`), bitwise (`& | ^ ~ << >>`) and reference (`&` address-of, `*`
+  dereference) operations are expressions; anything else still has to be
+  expressed through inline assembly or in called functions.
+- **Structs, but only structs.** Structs are named, never anonymous, never
+  declared inline, and there are no generics or `impl` blocks. They are
+  declared at the top level with `name : struct { field : type, ... };`,
+  values are created by declaring a zero-initialised variable or global and
+  assigning fields, and fields are read and written with postfix `.`.
 - **No `return` statements.** A function body is exactly **one statement**,
   and the function returns the value of that statement. Multi-statement bodies
   are written as Rust-style statement expressions.
@@ -105,27 +114,34 @@ HSPL is deliberately stripped down, in the spirit of B:
   printing — is imported with `extern` and supplied by the standard library,
   which is written in x86-64 assembly and linked automatically.
 - **Inline assembly is the escape hatch.** Anything the high-level language
-  cannot express yet, it can express in `asm { ... }` blocks.
+  cannot express yet, it can express in `asm { ... }` blocks. Arithmetic,
+  bitwise, and reference operations no longer need it; it remains for machine
+  operations the operator set does not cover.
 
 The only keywords are `auto`, `asm`, `extern`, `if`, `else`, `jump`, `label`,
-`true`, and `false`. Type names are recognized where a type is expected, so
-everything else — including words like `while` and `return` — is an ordinary
-identifier.
+`true`, and `false`. Type names — including the names of structs you have
+declared — are recognized where a type is expected, so everything else,
+including words like `while` and `return`, is an ordinary identifier.
 
 ## The language
 
 ### Program structure
 
 A program is a sequence of *items*: `extern` declarations, global definitions,
-and functions. Items may appear in any order; functions see the whole file.
+functions, and struct declarations. Items may appear in any order, but a struct
+can only mention structs declared earlier in the same file.
 
 ```hspl
 extern print(word) : word;    // typed import from another translation unit
 extern tick() : int;          // no parameters, int result
 
+point : struct { x : word, y : word };   // a named struct type
+offset : struct { base : point, dx : word };
+
 answer : word 42;             // a global of type word with an initializer
 zero : byte;                  // a global with no initializer: zeroed on load
 plain 7;                      // no annotation on a global means word
+origin : point;               // struct globals are zero-initialised
 
 add(a : word, b : word) : word asm {  // a function
     movq $a, $out
@@ -140,11 +156,13 @@ program   := item*
 item      := 'extern' ident '(' [type (',' type)*] ')' [':' type] ';'   // import
            | ident '(' [binding (',' binding)*] ')' [':' type] statement // function
            | ident [':' type] [integer | 'true' | 'false'] ';'           // global
+           | ident ':' 'struct' '{' field (',' field)* [','] '}' ';'      // struct
 
 binding   := ident [':' type]
+field     := binding
 
 statement := 'auto' binding (',' binding)* ';'
-           | ident '=' expression ';'          // assignment
+           | assign_path '=' expression ';'    // assign_path is ident ('.' ident)*
            | 'jump' ident ';'                  // goto
            | ident ':'                         // label
            | 'label' ident (';' | ':')         // label, keyword form
@@ -155,10 +173,19 @@ statement := 'auto' binding (',' binding)* ';'
 
 expression := integer | float | 'true' | 'false'
            | ident | ident '(' [expression (',' expression)*] ')'
+           | expression '.' ident                // field access
            | 'asm' '{' raw assembly '}'
            | 'if' ['('] expression [')'] expression ['else' expression]
            | '{' statement* [expression] '}'
+           | unary_op expression
+           | expression binary_op expression
+
+unary_op  := '-' | '~' | '&' | '*'
+binary_op := '|' | '^' | '&' | '<<' | '>>' | '+' | '-' | '*' | '/' | '%'
 ```
+
+Precedence, loosest to tightest: `|` < `^` < `&` < shifts < `+`/`-` <
+`*`/`/`/`%` < unary. Binary operators are left-associative.
 
 Annotations are always written *after* the name they describe:
 `f(x : int) : byte`, `y : word`, `answer : word 42`. A missing **value-type**
@@ -167,7 +194,8 @@ annotation (on a parameter, local, or global) means `word`; a missing
 
 ### Types and conversions
 
-HSPL has eight types. Types come after the name they describe.
+HSPL has eight primitive types plus named struct types. Types come after the
+name they describe.
 
 ```hspl
 answer : word 42;                // global
@@ -187,13 +215,15 @@ f(x : byte, y : short) : int {   // parameters and return type
 | `float`| `f32`  | 32   | any finite IEEE-754 single        |
 | `double`| `f64` | 64   | any finite IEEE-754 double        |
 | `void` | —      | —    | no value; the default return type |
+| `point` | `%point = type { i64, i64 }` in the IR | — | a named struct type: `point : struct { x : word, y : word };` |
 
 **Integer literals** adopt the type required by context — a literal is never
 inferred in isolation — and are then range-checked. Both the signed and the
 unsigned spelling of a width's range are accepted, so `byte 255` stores `-1`
 and `int 0xFFFFFFFF` stores `-1`. Hex literals wrap to 64 bits, which is how
-the full range of `word` is written. There is no unary minus, so negative
-values are normally written in two's-complement hex (`byte 0x80` is `-128`).
+the full range of `word` is written. A unary minus operator exists, so a
+negative literal such as `-128` written against a `byte` context is accepted;
+values are stored in the type's width as usual.
 
 **Floating-point literals** are decimal, with an optional fraction and an
 optional exponent: `1.5`, `1.`, `0.5`, `1e10`, `1.5E-3`, `2e+5`. A literal must
@@ -205,15 +235,16 @@ stored constant is exactly what was written; `0.1` stores the exact f64 nearest
 then range-checked, exactly like an integer literal: it defaults to `double`,
 is rejected in `float` context when the value is out of range or not finite
 (e.g. `1e999`), and cannot be used as an integer. An integer literal adopts a
-floating-point context only when exactly representable: `double d = 2;` is
-fine; `double d = 9007199254740993;` is an error, because 2⁵³+1 is not
+floating-point context only when exactly representable: `f() : double 2;` is
+fine; `f() : double 9007199254740993;` is an error, because 2⁵³+1 is not
 representable.
 
 **`void`** produces no value. A `void` function is called as a statement and
 its result cannot be used in an expression. `void` is only valid as a function
-or `extern` return type — never for locals, parameters, or globals — and it
-is the default when a function or `extern` omits its return type. A `void`
-`main` is wrapped by the C-ABI `i32 main()` and exits with status `0`.
+or `extern` return type — never for locals, parameters, globals, or struct
+fields — and it is the default when a function or `extern` omits its return
+type. A `void` `main` is wrapped by the C-ABI `i32 main()` and exits with
+status `0`.
 
 **Conversions** are implicit only when widening:
 
@@ -222,25 +253,44 @@ is the default when a function or `extern` omits its return type. A `void`
 - `float` → `double` (widen)
 - `byte` → `float`, `short` → `float` (exactly representable)
 - `byte` → `double`, `short` → `double`, `int` → `double` (exactly representable)
+- struct → same struct (identity, how a field is assigned)
 
-Anything else is rejected, including narrowing, same-width conversions, and any float-to-integer conversion (an explicit conversion does not exist yet):
+Anything else is rejected, including narrowing, same-width conversions, any
+float-to-integer conversion, and any conversion to or from a struct (a struct
+value can only flow to a `struct` of the same name, e.g. assignment; an
+explicit conversion does not exist yet):
 
 ```hspl
 f(x : word) : byte x;   // error: cannot implicitly convert `word` to `byte`
 ```
 
-### Items: `extern`, globals, and functions
+### Items: externs, globals, functions, structs
 
 **Externs** declare symbols defined in another translation unit. They are
 fully typed: parameter types (without names) and an optional return type,
 which defaults to `void`. Calls are arity- and type-checked and arguments are
 widened as needed. Symbols other than the standard library's must be supplied
-by whatever you link alongside the generated IR.
+by whatever you link alongside the generated IR. `extern` signatures cannot
+mention struct types.
+
+**Structs** are declared at the top level, before being used. The name becomes
+the type used in later annotations (`auto p : point;`, `f(p : point)`, return
+types). A struct may only mention structs declared earlier in the same file:
+
+```hspl
+point : struct { x : word, y : word };
+offset : struct { base : point, dx : word };
+```
 
 **Globals** are a name, an optional `: type`, an optional literal initializer,
 and `;`. The initializer may be an integer or `true`/`false` and is
 range-checked against the global's type. Globals without an initializer are
-zeroed. Globals are assignable, like locals.
+zeroed — struct globals become the all-zero struct (`@origin = global %point
+zeroinitializer`). Globals are assignable, like locals.
+
+**Structs in memory** are packed as laid out of their fields of ordinary LLVM
+types, so `point : struct { x : word, y : word };` is `{ i64, i64 }`. Fields are
+addressed with `getelementptr` through the named (never anonymous) struct type.
 
 **Functions** are a name, a parenthesised typed parameter list, an optional
 `: type` return annotation (which defaults to `void`), and exactly one
@@ -252,14 +302,24 @@ identity(x : word) : word x;       // expression body
 nothing() { }                      // no return annotation: void, empty body
 
 constant() : word 42;
+
+add(p : point, q : point) : point {   // struct parameters pass by value
+    auto out : point;
+    out.x = p.x + q.x;
+    out.y = p.y + q.y;
+    out
+}
 ```
+
+Functions and globals are assignable as expected, but a function is not a
+first-class value: it cannot be stored or passed as an argument yet.
 
 ### Statements
 
 | Form                       | Meaning                                                              |
 | -------------------------- | ------------------------------------------------------------------- |
 | `auto a : int, b;`         | Declare locals (missing annotations mean `word`), zero-initialised    |
-| `name = expr;`             | Assignment, converted to the variable's type if widening              |
+| `path = expr;`             | Assignment to a variable or struct field (`p.x = 5;`), converted to the target's type if widening |
 | `jump name;`               | Unconditional jump to a function-scoped label                         |
 | `name:` / `label name;`    | Define a jump target                                                  |
 | `expr;`                    | Expression statement                                                  |
@@ -267,9 +327,16 @@ constant() : word 42;
 | `;`                        | Empty statement; yields zero of the expected type                     |
 
 `auto` may declare several bindings in one statement, each with its own
-annotation. Locals are scoped to the block in which they are declared; a
-nested block may shadow an outer local. Declaring the same name twice in one
-block is an error.
+annotation; the initializer, if any, is given by `;` or by the enclosing
+context. Locals are scoped to the block in which they are declared; a nested
+block may shadow an outer local. Declaring the same name twice in one block is
+an error.
+
+`path` on the left of an assignment is either a single variable name (`v = 1;`)
+or one or more dotted segments (`p.x = 1;`, `s.base.inner.x = 42;`). The base of
+the path must resolve to a variable or a field access on one; anything else is a
+compile error. `p.x = 1;` is not sugar for anything — it stores through a GEP to
+the field of the variable's slot.
 
 ### Expressions
 
@@ -279,12 +346,35 @@ block is an error.
 | `1.5`, `1e10`               | Floating-point literal; adopts the expected type (`double` by default), range-checked |
 | `true`, `false`             | Boolean literal                                          |
 | `name`                      | Variable or global                                        |
+| `name.field`, `a.b.c`       | Field access on a struct value (chaining works)           |
 | `f(a, b)`                   | Function call                                             |
 | `if cond expr else expr`    | Conditional expression; braces are optional               |
 | `asm { ... }`               | Inline assembly block                                     |
 | `{ ... }`                   | Statement expression                                      |
+| `-x`, `~x`                  | Unary operations: negate, bitwise not                    |
+| `a + b`, `a - b`, `a * b`, `a / b`, `a % b` | Arithmetic                     |
+| `a & b`, `a \| b`, `a ^ b`, `a << b`, `a >> b` | Bitwise and shifts        |
+| `&x`, `*x`                  | Reference: address-of a `word`, dereference it         |
 
-That is the entire expression language — there are no operators to build from.
+Binary operators combine two operands; unary operators prefix one. Precedence,
+from loosest to tightest, is `|` < `^` < `&` < shifts < `+`/`-` < `*`/`/`/`%` <
+unary. For example, `2 + 3 * 4` is `14`, and `100 - 10 - 5` is `85`
+(left-associative).
+
+The operations run on the usual types: arithmetic and bitwise operations on
+all the integer types (`word`, `int`, `short`, `byte`) and on `float`/`double`
+(floating point); reference operations on `word`. The boolean type is not an
+arithmetic type; structs are never operands to an operator (operate on their
+fields instead). Everything else produces a compile error.
+
+That is the rest of the expression language. There are no comparison or
+logical operators yet, so conditions are integer, floating-point, or boolean
+values compared against zero by `if`.
+
+Reference operations are intentionally narrow: `&x` takes the address of a
+`word` variable or global, and `*p` loads through a `word` holding an address.
+The result of address-of is a plain `word` — it is not a typed pointer, and
+`*p` always loads a `word`.
 
 ### Statement expressions
 
@@ -304,7 +394,11 @@ Because blocks are expressions, they compose — one can be passed directly as a
 argument:
 
 ```hspl
-print({ auto n : word; n = 21; double(n) });
+double(n : word) : word n + n;
+
+extern print(word) : word;
+
+main() : word print({ auto n : word; n = 21; double(n) });
 ```
 
 The body of a function is a single statement, so a block body both computes the
@@ -321,7 +415,7 @@ choose(flag : bool) : int if flag { 42 } else { 7 };
 
 - It yields the value of the taken branch. Without `else`, the false path
   yields zero of the expected type.
-- The condition may be `bool`, or any integer, which is true when non-zero; a floating-point condition is true when it is not zero (NaN is false).
+- The condition may be `bool`, or any integer, which is true when non-zero; a floating-point condition is true when it is not zero (NaN is false, as in IEEE-754 comparisons). A struct is rejected as a condition.
 - Both `if cond ...` and `if (cond) ...` are accepted.
 - Each branch is an expression, and `{ ... }` is itself an expression, so
   braces are optional: `choose(flag) : int if flag 42 else 7;`
@@ -365,7 +459,8 @@ defaults to `word`. In statement position it is evaluated for its side effects
 and its result is discarded. The body is raw assembly for the host target,
 parsed by LLVM's inline-asm parser (AT&T dialect by default); input operands
 keep their variables' types. Floating-point operands use the `x` constraint
-(an SSE register on x86-64); integer operands use `r`.
+(an SSE register on x86-64); integer operands use `r`. Structs cannot be
+operands — load their fields into variables instead.
 
 ```hspl
 add(a : word, b : word) : word asm {
@@ -423,7 +518,8 @@ define i32 @main() {
 }
 ```
 
-`main` cannot take parameters, and cannot return `float` or `double` — use an integer type (or omit the annotation for `void`).
+`main` cannot take parameters, and cannot return `float`, `double`, or a
+struct — use an integer type (or omit the annotation for `void`).
 
 ## Standard library
 
@@ -447,7 +543,8 @@ main() : word print(42);
 
 Calling `print` without the declaration is a compile error that suggests the
 missing `extern`. Because the library always defines the symbol, defining a
-function or global named `print` is also rejected.
+function or global named `print` is also rejected — as is naming a struct
+`print`.
 
 Other symbols must be supplied by whatever you link alongside the generated
 IR. Extern data symbols, richer I/O, and allocation are on the
@@ -492,6 +589,8 @@ Each example is self-contained and covers a slice of the language.
 | [`examples/words.hspl`](examples/words.hspl) | Zero-initialised globals, hex and two's-complement words | `0`, `-1`, `9223372036854775807`, `42` |
 | [`examples/asm.hspl`](examples/asm.hspl) | Asm inputs/outputs, `$$` immediates, explicit `$0`, word and byte operands | `42`, `42`, `-7`, `42`, `42` |
 | [`examples/floats.hspl`](examples/floats.hspl) | `float`/`double`, float literals, exact integer-to-float widening, float conditions, float asm operands | `1`, `1`, `0`, `1`, `1`, `1` (exit `0`) |
+| [`examples/ops.hspl`](examples/ops.hspl) | Arithmetic, bitwise, shift, and reference (`&`/`*`) operators | `42`, `42`, `90`, `42`, `10`, `1`, `8`, `14`, `6`, `-1`, `48`, `63`, `-5`, `7`, `5`, `42` |
+| [`examples/structs.hspl`](examples/structs.hspl) | Named struct declarations, field access, field assignment, nesting, by-value parameters and returns | `42`, `21`, `24`, `31`, `15`, `21` |
 | [`examples/scopes.hspl`](examples/scopes.hspl) | Typed `auto`, assignment, mutable globals, shadowing, widening at a call | `41`, `3`, `7`, `42`, `7` |
 | [`examples/functions.hspl`](examples/functions.hspl) | Empty statement, expression bodies, empty body, block bodies, nested calls and blocks, calling a function defined later | `7`, `0`, `42`, `9`, `42`, `42`, `42` |
 | [`examples/types.hspl`](examples/types.hspl) | Every primitive, defaults, literal ranges, `bool` literals, all widening conversions, typed asm, zero-valued blocks | `9223372036854775807`, `42`, `1000`, `-56`, `1`, `0`, `7`, `127`, `-128`, `-1`, `1`, `0`, `1`, `127`, `10`, `42`, `0` (exit `42`) |
@@ -571,9 +670,9 @@ src/
   main.rs      CLI driver: compile, link with the standard library
   lib.rs       Public pipeline API (parse_source, compile_to_ir)
   lexer.rs     Tokenizer; captures `asm { ... }` bodies raw
-  parser.rs    Recursive-descent parser (no precedence table needed!)
-  ast.rs       AST definitions and the `Type` enum
-  codegen.rs   LLVM IR generation (Inkwell), including widening rules
+  parser.rs    Recursive-descent parser (precedence climbing for operators)
+  ast.rs       AST definitions and the `Type` enum (primitives + named structs)
+  codegen.rs   LLVM IR generation (Inkwell), including widening rules and struct GEP addressing
 std/
   print.s      Standard library, written in x86-64 assembly
 examples/      One self-contained program per language feature
@@ -613,19 +712,36 @@ llc /tmp/types.ll -o /tmp/types.s
   (or whatever signature you need) at the top of your program.
 - **`jump to undefined label 'x'`** — jumps are function-scoped; the label must
   be defined somewhere in the same function body.
+- **`error: struct X has no field Y`** — field access is checked against the
+  struct's declaration; the error lists the fields it does know.
+- **`error: unknown type 'foo' (… or a declared struct)`** — struct names are
+  resolved lexically by declaration order in the file: the struct must be
+  declared before (not after) the position in which the name appears.
+- **`error: 'extern' signatures cannot use struct types`** — `extern` currently
+  only carries primitive types. Pass struct data to foreign code through
+  scalars, or keep the API inside HSPL (structs pass by value between HSPL
+  functions).
+- **`error: cannot implicitly convert 'point' to 'word'`** — struct values can
+  only be assigned to structs of the same shape. Use a field (`p.x = v;`)
+  rather than a coercion.
 
 ## Roadmap
 
 - `while` and `for` sugar built on labels and jumps
 - Hexadecimal floating-point literals (`0x1.8p3`)
-- A `printdouble`-style symbol in the standard library (today `print` handles integers only)
 - Explicit casts, so narrowing can be written down
+- Struct literals and constructors (e.g. `point { x : 1, y : 2 }`); today
+  structs are built by declaring a zero-initialised value and assigning fields
+- Struct types in `extern` signatures (needs `byval`/`sret` attributes)
+- Comparisons and logical operators
+- A `printdouble`-style symbol in the standard library (today `print` handles integers only)
 - **More standard library**: `putchar`, word input, and allocation, all in
   assembly
 - `extern` data symbols (not just functions)
+- Reference operations on non-`word` values (today `&`/`*` only work on `word`)
 - Assembly clobber lists, multiple outputs, and typed constraints
 - Proper calling-convention support for external C functions
-- Strings/byte data and address-of support
+- Strings/byte data
 - Optimization pipeline and object-file emission
 - Source spans and better diagnostics
 

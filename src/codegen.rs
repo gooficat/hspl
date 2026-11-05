@@ -1,12 +1,20 @@
 //! LLVM IR generation for HSPL.
 //!
-//! Every value has one of eight types: five integer types (`word`, `int`,
-//! `short`, `byte`, `bool`), two IEEE-754 floating-point types (`float`,
-//! `double`), and `void`, which is only valid as a function or `extern`
+//! Every value has one of the nine types: five integer types (`word`,
+//! `int`, `short`, `byte`, `bool`), two IEEE-754 floating-point types (`float`,
+//! `double`), named struct types (`point : struct { x : word, y : word };`),
+//! and `void`, which is only valid as a function or `extern`
 //! return type and produces no value. They are represented as LLVM `i64`,
-//! `i32`, `i16`, `i8`, `i1`, `f32`, `f64`, and `void`. There are no
-//! operators; computation happens through function calls, inline assembly, and
-//! a small set of control-flow constructs.
+//! `i32`, `i16`, `i8`, `i1`, `f32`, `f64`, `%name = type { ... }`, and
+//! `void`. There are no comparison
+//! or logical operators yet; arithmetic (`+ - * / %`), bitwise (`& | ^ ~ <<
+//! >>`) and reference (`&` address-of, `*` dereference) operators are
+//! expressions, and computation happens through those operations, function
+//! calls, inline assembly, and a small set of control-flow constructs.
+//!
+//! Struct values are zero-initialised, pass by value between functions, and
+//! are addressed field-by-field through GEPs (the base pointer itself is
+//! folded by LLVM's zero-index fold when it is the first field).
 //!
 //! - Globals become module-level globals of their declared type.
 //! - Functions use their annotated parameter and return types. The result is the
@@ -51,11 +59,13 @@ use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::targets::TargetMachine;
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
-use inkwell::{FloatPredicate, IntPredicate};
+use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
-use crate::ast::{Binding, Block, Expr, Function, Item, Literal, Program, Stmt, Type};
+use crate::ast::{
+    Binding, Block, BinaryOp, Expr, Function, Item, Literal, Program, Stmt, Type, UnaryOp,
+};
 
 /// The standard library defines `print`, so a program cannot also define it.
 const RESERVED_PRINT: &str =
@@ -79,6 +89,7 @@ pub fn generate(program: &Program, module_name: &str) -> Result<String, String> 
         label_blocks: HashMap::new(),
         defined_labels: HashSet::new(),
         jumped_labels: HashSet::new(),
+        structs: HashMap::new(),
     };
 
     // Tag the module for the host so downstream tools do not warn.
@@ -111,7 +122,7 @@ struct FnSig<'ctx> {
 
 /// A value together with the HSPL type it carries. When `ty` is [`Type::Void`],
 /// `value` is `None` because `void` produces no value.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TypedValue<'ctx> {
     value: Option<BasicValueEnum<'ctx>>,
     ty: Type,
@@ -139,6 +150,8 @@ struct Codegen<'ctx> {
     defined_labels: HashSet<String>,
     /// Labels referenced by `jump` in the current function.
     jumped_labels: HashSet<String>,
+    /// Named LLVM struct types for each declared HSPL struct, keyed by name.
+    structs: HashMap<String, StructType<'ctx>>,
 }
 
 /// Shorthand for the builder's `Result<T, BuilderError>`.
@@ -146,11 +159,36 @@ fn build<T>(result: Result<T, BuilderError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
 }
 
+/// The source spelling of a binary operation, for diagnostics.
+fn op_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "add",
+        BinaryOp::Sub => "sub",
+        BinaryOp::Mul => "mul",
+        BinaryOp::Div => "div",
+        BinaryOp::Rem => "rem",
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Xor => "xor",
+        BinaryOp::Shl => "shl",
+        BinaryOp::Shr => "shr",
+    }
+}
+
+/// Whether a binary operation is a bitwise (or shift) operation, which only
+/// make sense for integers.
+fn is_bitwise(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor | BinaryOp::Shl | BinaryOp::Shr
+    )
+}
+
 /// Check that `value` can be represented by `ty` when written as a literal.
 ///
 /// The accepted range covers both the signed and unsigned interpretations of
 /// the type's width, so `byte 255` (stored as -1) and `int 0xFFFFFFFF` work.
-fn check_literal(value: i64, ty: Type, context: &str) -> Result<(), String> {
+fn check_literal(value: i64, ty: &Type, context: &str) -> Result<(), String> {
     let (min, max): (i128, i128) = match ty {
         // Every `i64` is a valid word; hex literals wrap to `i64` in the lexer.
         Type::Word => return Ok(()),
@@ -162,6 +200,12 @@ fn check_literal(value: i64, ty: Type, context: &str) -> Result<(), String> {
             unreachable!("literal_value routes floating-point targets before check_literal")
         }
         Type::Void => return Ok(()),
+        Type::Struct { .. } => {
+            return Err(format!(
+                "{context} {value} cannot be used as a `{}` value",
+                ty.name()
+            ))
+        }
     };
 
     let value = value as i128;
@@ -177,7 +221,7 @@ fn check_literal(value: i64, ty: Type, context: &str) -> Result<(), String> {
 /// Check that `value` can be represented by `ty` when written as a
 /// floating-point literal. Overflow to infinity (or an already-infinite
 /// value) is rejected.
-fn check_float_literal(value: f64, ty: Type, context: &str) -> Result<(), String> {
+fn check_float_literal(value: f64, ty: &Type, context: &str) -> Result<(), String> {
     let limit = match ty {
         Type::Float => f32::MAX as f64,
         Type::Double => f64::MAX,
@@ -194,7 +238,7 @@ fn check_float_literal(value: f64, ty: Type, context: &str) -> Result<(), String
 
 /// The largest integer magnitude exactly representable in `ty`. `i64` literals
 /// beyond this cannot be converted to a float constant without rounding.
-fn exact_integer_limit(ty: Type) -> i128 {
+fn exact_integer_limit(ty: &Type) -> i128 {
     match ty {
         Type::Float => 1i128 << 24,
         Type::Double => 1i128 << 53,
@@ -205,70 +249,88 @@ fn exact_integer_limit(ty: Type) -> i128 {
 impl<'ctx> Codegen<'ctx> {
     // ----- types ---------------------------------------------------------
 
+    /// Whether `ty` is an integer type that the built-in operations run on:
+    /// `word` (64-bit), `int` (32-bit), `short` (16-bit), or `byte` (8-bit).
+    /// The boolean type is not an arithmetic type.
+    fn is_plain_int(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Word | Type::Int | Type::Short | Type::Byte)
+    }
+
     fn int_type(&self, ty: Type) -> IntType<'ctx> {
-        match ty {
-            Type::Word => self.context.i64_type(),
-            Type::Int => self.context.i32_type(),
-            Type::Short => self.context.i16_type(),
-            Type::Byte => self.context.i8_type(),
-            Type::Bool => self.context.bool_type(),
-            Type::Void => panic!("internal error: `void` has no integer representation"),
-            Type::Float | Type::Double => {
-                panic!("internal error: `{}` has no integer representation", ty.name())
-            }
+        match &ty {
+            Type::Word => return self.context.i64_type(),
+            Type::Int => return self.context.i32_type(),
+            Type::Short => return self.context.i16_type(),
+            Type::Byte => return self.context.i8_type(),
+            Type::Bool => return self.context.bool_type(),
+            _ => {}
         }
+        panic!("internal error: `{}` has no integer representation", ty.name())
     }
 
     fn float_type(&self, ty: Type) -> inkwell::types::FloatType<'ctx> {
-        match ty {
-            Type::Float => self.context.f32_type(),
-            Type::Double => self.context.f64_type(),
-            _ => panic!("internal error: `{}` has no floating-point representation", ty.name()),
+        match &ty {
+            Type::Float => return self.context.f32_type(),
+            Type::Double => return self.context.f64_type(),
+            _ => {}
         }
+        panic!("internal error: `{}` has no floating-point representation", ty.name())
+    }
+
+    /// The named LLVM struct type for a declared HSPL struct.
+    fn struct_llvm_type(&self, name: &str) -> StructType<'ctx> {
+        self.structs
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("internal error: struct `{name}` was not declared"))
     }
 
     /// The LLVM type for any first-class HSPL type.
     fn llvm_type(&self, ty: Type) -> BasicTypeEnum<'ctx> {
-        match ty {
+        match &ty {
             Type::Void => panic!("internal error: `void` is not a first-class LLVM type"),
             Type::Float => self.context.f32_type().into(),
             Type::Double => self.context.f64_type().into(),
+            Type::Struct { name, .. } => self.struct_llvm_type(name).into(),
             _ => self.int_type(ty).into(),
         }
     }
 
     /// The LLVM function type for a signature. `void` returns LLVM `void`;
     /// floating-point returns use the matching float type; everything else is
-    /// an integer.
+    /// an integer. Struct types use their named aggregate.
     fn fn_type(
         &self,
         ret: Type,
         params: &[BasicMetadataTypeEnum<'ctx>],
     ) -> inkwell::types::FunctionType<'ctx> {
-        match ret {
+        match &ret {
             Type::Void => self.context.void_type().fn_type(params, false),
-            Type::Float | Type::Double => self.float_type(ret).fn_type(params, false),
-            _ => self.int_type(ret).fn_type(params, false),
+            Type::Float | Type::Double => self.float_type(ret.clone()).fn_type(params, false),
+            Type::Struct { name, .. } => self
+                .struct_llvm_type(name)
+                .fn_type(params, false),
+            _ => self.int_type(ret.clone()).fn_type(params, false),
         }
     }
 
     /// A zero of `ty`, or no value when `ty` is `void`.
     fn zero(&self, ty: Type) -> TypedValue<'ctx> {
-        TypedValue {
-            value: if ty.is_void() {
-                None
-            } else {
-                Some(self.llvm_type(ty).const_zero())
-            },
-            ty,
-        }
+        let value = if ty.is_void() {
+            None
+        } else if let Type::Struct { name, .. } = &ty {
+            Some(self.struct_llvm_type(name).const_zero().into())
+        } else {
+            Some(self.llvm_type(ty.clone()).const_zero())
+        };
+        TypedValue { value, ty }
     }
 
     /// An integer constant of `ty` with the bit pattern of `value`. `ty` must
     /// be a value type, not `void` and not floating-point.
     fn constant(&self, ty: Type, value: i64) -> TypedValue<'ctx> {
         TypedValue {
-            value: Some(self.int_type(ty).const_int(value as u64, false).into()),
+            value: Some(self.int_type(ty.clone()).const_int(value as u64, false).into()),
             ty,
         }
     }
@@ -276,7 +338,7 @@ impl<'ctx> Codegen<'ctx> {
     /// A floating-point constant of `ty` (`float` or `double`).
     fn float_constant(&self, ty: Type, value: f64) -> TypedValue<'ctx> {
         TypedValue {
-            value: Some(self.float_type(ty).const_float(value).into()),
+            value: Some(self.float_type(ty.clone()).const_float(value).into()),
             ty,
         }
     }
@@ -291,9 +353,21 @@ impl<'ctx> Codegen<'ctx> {
         literal: &Literal,
         context: &str,
     ) -> Result<TypedValue<'ctx>, String> {
-        match (literal, ty) {
+        // A struct global or local is zero-initialised; there is no struct
+        // literal syntax, so the synthetic zero from the parser is the only
+        // literal a struct is ever paired with.
+        if let Type::Struct { .. } = ty {
+            return match literal {
+                Literal::Int(0) => Ok(self.zero(ty)),
+                _ => Err(format!(
+                    "{context} cannot be used as a `{}` initializer; struct values are zero-initialised and their fields are assigned one at a time",
+                    ty.name()
+                )),
+            };
+        }
+        match (literal, &ty) {
             (Literal::Int(value), Type::Float | Type::Double) => {
-                if (*value as i128).abs() <= exact_integer_limit(ty) {
+                if (*value as i128).abs() <= exact_integer_limit(&ty) {
                     Ok(self.float_constant(ty, *value as f64))
                 } else {
                     Err(format!(
@@ -303,11 +377,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             (Literal::Int(value), _) => {
-                check_literal(*value, ty, context)?;
+                check_literal(*value, &ty, context)?;
                 Ok(self.constant(ty, *value))
             }
             (Literal::Float(value), Type::Float | Type::Double) => {
-                check_float_literal(*value, ty, context)?;
+                check_float_literal(*value, &ty, context)?;
                 Ok(self.float_constant(ty, *value))
             }
             (Literal::Float(value), _) => Err(format!(
@@ -335,7 +409,7 @@ impl<'ctx> Codegen<'ctx> {
             return Ok(TypedValue { value: value.value, ty: target });
         }
 
-        if !value.ty.can_widen_to(target) {
+        if !value.ty.can_widen_to(&target) {
             return Err(format!(
                 "cannot implicitly convert `{}` to `{}` (only widening conversions are allowed)",
                 value.ty.name(),
@@ -348,7 +422,7 @@ impl<'ctx> Codegen<'ctx> {
         // Floating-point targets: widening between floats, or an exact
         // integer (or bool) to float.
         if target.is_float() {
-            let target_type = self.float_type(target);
+            let target_type = self.float_type(target.clone());
             if value.ty.is_float() {
                 let extended = build(
                     self.builder.build_float_ext(input.into_float_value(), target_type, "fpext"),
@@ -381,7 +455,7 @@ impl<'ctx> Codegen<'ctx> {
         // Integer targets can only come from integer sources: a float source
         // would have been rejected by `can_widen_to`.
         let input = input.into_int_value();
-        let target_type = self.int_type(target);
+        let target_type = self.int_type(target.clone());
         let extended = if value.ty.is_bool() {
             build(self.builder.build_int_z_extend(input, target_type, "zext"))?
         } else {
@@ -398,6 +472,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn declare(&mut self, program: &Program) -> Result<(), String> {
         let mut seen = HashSet::new();
+        let mut seen_structs = HashSet::new();
 
         for item in &program.items {
             match item {
@@ -425,40 +500,85 @@ impl<'ctx> Codegen<'ctx> {
                         return Err(format!("`{}` is defined more than once", function.name));
                     }
                 }
+                Item::StructDecl(decl) => {
+                    if decl.name == "print" {
+                        return Err(RESERVED_PRINT.to_string());
+                    }
+                    if Type::from_name(&decl.name).is_some() {
+                        return Err(format!(
+                            "struct `{}` cannot use a builtin type name",
+                            decl.name
+                        ));
+                    }
+                    if !seen_structs.insert(decl.name.clone()) {
+                        return Err(format!("struct `{}` is defined more than once", decl.name));
+                    }
+                    if !seen.insert(decl.name.clone()) {
+                        return Err(format!("`{}` is defined more than once", decl.name));
+                    }
+                }
+            }
+        }
+
+        // Create the struct types in two passes: every named type exists
+        // before any body is emitted.
+        for item in &program.items {
+            if let Item::StructDecl(decl) = item {
+                let struct_ty = self.context.opaque_struct_type(&decl.name);
+                self.structs.insert(decl.name.clone(), struct_ty);
+            }
+        }
+        for item in &program.items {
+            if let Item::StructDecl(decl) = item {
+                let field_types: Vec<BasicTypeEnum<'ctx>> = decl
+                    .fields
+                    .iter()
+                    .map(|field| self.llvm_type(field.ty.clone()))
+                    .collect();
+                self.struct_llvm_type(&decl.name)
+                    .set_body(&field_types, false);
             }
         }
 
         for item in &program.items {
             if let Item::Global(global) = item {
                 let context = format!("global `{}` initializer", global.name);
-                let constant = self.literal_value(global.ty, &global.init, &context)?;
+                let constant = self.literal_value(global.ty.clone(), &global.init, &context)?;
                 let value = self
                     .module
-                    .add_global(self.llvm_type(global.ty), None, &global.name);
+                    .add_global(self.llvm_type(global.ty.clone()), None, &global.name);
                 let basic = constant.value.expect("global initializer has a value");
                 value.set_initializer(&basic);
                 self.globals.insert(
                     global.name.clone(),
-                    (value.as_pointer_value(), global.ty),
+                    (value.as_pointer_value(), global.ty.clone()),
                 );
             }
         }
 
         for item in &program.items {
             if let Item::Extern(decl) = item {
+                for ty in decl.params.iter().chain(std::iter::once(&decl.ret)) {
+                    if ty.is_struct() {
+                        return Err(format!(
+                            "`extern` signatures cannot use struct types (struct `{}`); struct values are passed by value between HSPL functions only",
+                            ty.name()
+                        ));
+                    }
+                }
                 let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = decl
                     .params
                     .iter()
-                    .map(|ty| self.llvm_type(*ty).into())
+                    .map(|ty| self.llvm_type(ty.clone()).into())
                     .collect();
-                let fn_type = self.fn_type(decl.ret, &param_types);
+                let fn_type = self.fn_type(decl.ret.clone(), &param_types);
                 let value = self.module.add_function(&decl.name, fn_type, None);
                 self.externs.insert(
                     decl.name.clone(),
                     FnSig {
                         value,
                         params: decl.params.clone(),
-                        ret: decl.ret,
+                        ret: decl.ret.clone(),
                     },
                 );
             }
@@ -484,6 +604,12 @@ impl<'ctx> Codegen<'ctx> {
                         .to_string(),
                 );
             }
+            if function.ret.is_struct() {
+                return Err(
+                    "`main` cannot return a struct type; return an integer type (or omit the annotation for `void`)"
+                        .to_string(),
+                );
+            }
         }
 
         let mut params = HashSet::new();
@@ -505,9 +631,9 @@ impl<'ctx> Codegen<'ctx> {
         let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = function
             .params
             .iter()
-            .map(|param| self.llvm_type(param.ty).into())
+            .map(|param| self.llvm_type(param.ty.clone()).into())
             .collect();
-        let fn_type = self.fn_type(function.ret, &param_types);
+        let fn_type = self.fn_type(function.ret.clone(), &param_types);
 
         let llvm_name = Self::llvm_function_name(&function.name);
         let value = self.module.add_function(&llvm_name, fn_type, None);
@@ -515,8 +641,8 @@ impl<'ctx> Codegen<'ctx> {
             function.name.clone(),
             FnSig {
                 value,
-                params: function.params.iter().map(|param| param.ty).collect(),
-                ret: function.ret,
+                params: function.params.iter().map(|param| param.ty.clone()).collect(),
+                ret: function.ret.clone(),
             },
         );
         Ok(())
@@ -558,7 +684,7 @@ impl<'ctx> Codegen<'ctx> {
         for (index, param) in function.params.iter().enumerate() {
             let slot = build(
                 self.alloca_builder
-                    .build_alloca(self.llvm_type(param.ty), &param.name),
+                    .build_alloca(self.llvm_type(param.ty.clone()), &param.name),
             )?;
             let arg = sig
                 .value
@@ -568,19 +694,19 @@ impl<'ctx> Codegen<'ctx> {
             self.scopes
                 .last_mut()
                 .expect("scope exists")
-                .insert(param.name.clone(), (slot, param.ty));
+                .insert(param.name.clone(), (slot, param.ty.clone()));
         }
 
         // The body's value is the function's result. A `void` function yields
         // no value and ends with `ret void`.
-        let result = self.gen_stmt(&function.body, Some(function.ret))?;
+        let result = self.gen_stmt(&function.body, Some(function.ret.clone()))?;
 
         if function.ret.is_void() {
             if self.current_block()?.get_terminator().is_none() {
                 build(self.builder.build_return(None))?;
             }
         } else {
-            let result = self.coerce(result, function.ret)?;
+            let result = self.coerce(result, function.ret.clone())?;
 
             // A body ending in `jump` already terminates its block. Otherwise
             // return the value it produced.
@@ -644,6 +770,9 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float | Type::Double => {
                 unreachable!("`main` cannot return a floating-point type")
             }
+            Type::Struct { .. } => {
+                unreachable!("`main` cannot return a struct type")
+            }
         };
 
         let returned: BasicValueEnum = converted.into();
@@ -673,24 +802,29 @@ impl<'ctx> Codegen<'ctx> {
                 for binding in bindings {
                     self.declare_local(binding)?;
                 }
-                self.zero(expected.unwrap_or(Type::Word))
+                self.zero(expected.clone().unwrap_or(Type::Word))
             }
-            Stmt::Assign(name, expr) => {
-                let (slot, ty) = self
-                    .lookup(name)
-                    .ok_or_else(|| format!("assignment to undefined variable `{name}`"))?;
-                let value = self.gen_expr(expr, Some(ty))?;
-                let value = self.coerce(value, ty)?;
+            Stmt::Assign(path, expr) => {
+                let mut components = path.split('.');
+                let base = components.next().expect("assignment path has a base");
+                let (mut slot, mut ty) = self
+                    .lookup(base)
+                    .ok_or_else(|| format!("assignment to undefined variable `{base}`"))?;
+                for field in components {
+                    (slot, ty) = self.field_pointer(slot, &ty, field)?;
+                }
+                let value = self.gen_expr(expr, Some(ty.clone()))?;
+                let value = self.coerce(value, ty.clone())?;
                 build(self.builder.build_store(
                     slot,
                     *value.value.as_ref().expect("assigned value"),
                 ))?;
                 value
             }
-            Stmt::Expr(expr) => self.gen_expr(expr, expected)?,
-            Stmt::Jump(name) => self.gen_jump(name, expected)?,
+            Stmt::Expr(expr) => self.gen_expr(expr, expected.clone())?,
+            Stmt::Jump(name) => self.gen_jump(name, expected.clone())?,
             Stmt::Label(_) => unreachable!("labels are handled above"),
-            Stmt::Empty => self.zero(expected.unwrap_or(Type::Word)),
+            Stmt::Empty => self.zero(expected.clone().unwrap_or(Type::Word)),
         };
 
         match expected {
@@ -809,7 +943,7 @@ impl<'ctx> Codegen<'ctx> {
         let branch_expected = if result_ty.is_void() {
             None
         } else {
-            Some(result_ty)
+            Some(result_ty.clone())
         };
 
         let function = self.current_function()?;
@@ -822,11 +956,11 @@ impl<'ctx> Codegen<'ctx> {
         )?;
 
         self.builder.position_at_end(then_block);
-        let then_value = self.gen_expr(then_branch, branch_expected)?;
+        let then_value = self.gen_expr(then_branch, branch_expected.clone())?;
         let then_value = if result_ty.is_void() {
             then_value
         } else {
-            self.coerce(then_value, result_ty)?
+            self.coerce(then_value, result_ty.clone())?
         };
         self.ensure_open_block()?;
         let then_end = self.current_block()?;
@@ -834,13 +968,13 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(else_block);
         let else_value = match else_branch {
-            Some(expr) => self.gen_expr(expr, branch_expected)?,
-            None => self.zero(result_ty),
+            Some(expr) => self.gen_expr(expr, branch_expected.clone())?,
+            None => self.zero(result_ty.clone()),
         };
         let else_value = if result_ty.is_void() {
             else_value
         } else {
-            self.coerce(else_value, result_ty)?
+            self.coerce(else_value, result_ty.clone())?
         };
         self.ensure_open_block()?;
         let else_end = self.current_block()?;
@@ -851,7 +985,7 @@ impl<'ctx> Codegen<'ctx> {
             return Ok(TypedValue { value: None, ty: Type::Void });
         }
 
-        let phi = build(self.builder.build_phi(self.llvm_type(result_ty), "if"))?;
+        let phi = build(self.builder.build_phi(self.llvm_type(result_ty.clone()), "if"))?;
         phi.add_incoming(&[
             (
                 &then_value.value.expect("then branch has a value"),
@@ -878,6 +1012,12 @@ impl<'ctx> Codegen<'ctx> {
         }
         if value.ty.is_bool() {
             return Ok(value.value.expect("condition is a value").into_int_value());
+        }
+        if value.ty.is_struct() {
+            return Err(format!(
+                "cannot use `{}` as a condition",
+                value.ty.name()
+            ));
         }
         if value.ty.is_float() {
             let float_value = value.value.expect("condition is a value").into_float_value();
@@ -919,17 +1059,17 @@ impl<'ctx> Codegen<'ctx> {
         // declaration (so a declaration inside a loop resets each iteration).
         let slot = build(
             self.alloca_builder
-                .build_alloca(self.llvm_type(binding.ty), &binding.name),
+                .build_alloca(self.llvm_type(binding.ty.clone()), &binding.name),
         )?;
         // `binding.ty` is never `void` (validated in `declare_function`), so
         // the zero value always exists.
-        let zero = self.zero(binding.ty).value.expect("local zero value");
+        let zero = self.zero(binding.ty.clone()).value.expect("local zero value");
         build(self.alloca_builder.build_store(slot, zero))?;
         build(self.builder.build_store(slot, zero))?;
         self.scopes
             .last_mut()
             .expect("scope exists")
-            .insert(binding.name.clone(), (slot, binding.ty));
+            .insert(binding.name.clone(), (slot, binding.ty.clone()));
         Ok(())
     }
 
@@ -945,7 +1085,7 @@ impl<'ctx> Codegen<'ctx> {
         // A `void` context discards the value but still validates and emits the
         // expression for its side effects (for example `void_fn();` as a
         // statement).
-        if expected.is_some_and(Type::is_void) {
+        if expected.as_ref().is_some_and(|ty| ty.is_void()) {
             return self
                 .gen_expr(expr, None)
                 .map(|_| TypedValue { value: None, ty: Type::Void });
@@ -971,8 +1111,18 @@ impl<'ctx> Codegen<'ctx> {
                 let (slot, ty) = self
                     .lookup(name)
                     .ok_or_else(|| format!("use of undefined variable `{name}`"))?;
-                let loaded = build(self.builder.build_load(self.llvm_type(ty), slot, name))?;
+                let loaded = build(self.builder.build_load(self.llvm_type(ty.clone()), slot, name))?;
                 let value = TypedValue { value: Some(loaded), ty };
+                match expected {
+                    Some(target) => self.coerce(value, target),
+                    None => Ok(value),
+                }
+            }
+            Expr::Field { base, field } => {
+                let (slot, fty) = self.field_address(base, field)?;
+                let loaded =
+                    build(self.builder.build_load(self.llvm_type(fty.clone()), slot, field))?;
+                let value = TypedValue { value: Some(loaded), ty: fty };
                 match expected {
                     Some(target) => self.coerce(value, target),
                     None => Ok(value),
@@ -981,12 +1131,311 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Call(name, args) => self.gen_call(name, args, expected),
             Expr::Asm(source) => self.gen_asm(source, expected.unwrap_or(Type::Word)),
             Expr::Block(block) => self.gen_block(block, expected),
+            Expr::Unary { op, operand } => self.gen_unary(*op, operand, expected),
+            Expr::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs, expected),
             Expr::If {
                 cond,
                 then_branch,
                 else_branch,
             } => self.gen_if(cond, then_branch, else_branch.as_deref(), expected),
         }
+    }
+
+    /// Lower a unary operation. `-`, `~`, `&` (address-of) and `*` (deref)
+    /// are the prefix operators; `&` and `*` also exist infix, where they are
+    /// handled by [`Codegen::gen_binary`].
+    fn gen_unary(
+        &mut self,
+        op: UnaryOp,
+        operand: &Expr,
+        expected: Option<Type>,
+    ) -> Result<TypedValue<'ctx>, String> {
+        let value = self.gen_expr(operand, expected.clone())?;
+
+        if value.ty.is_void() {
+            return Err("cannot apply a unary operation to `void`".to_string());
+        }
+
+        match op {
+            UnaryOp::Neg => {
+                if value.ty.is_float() {
+                    let result = build(
+                        self.builder
+                            .build_float_neg(value.value.expect("float operand").into_float_value(), "neg"),
+                    )?;
+                    return Ok(TypedValue {
+                        value: Some(result.into()),
+                        ty: value.ty,
+                    });
+                }
+                if self.is_plain_int(&value.ty) {
+                    let result = build(
+                        self.builder
+                            .build_int_neg(value.value.expect("integer operand").into_int_value(), "neg"),
+                    )?;
+                    return Ok(TypedValue {
+                        value: Some(result.into()),
+                        ty: value.ty,
+                    });
+                }
+                Err(format!(
+                    "the unary `-` operator cannot be applied to `{}`",
+                    value.ty.name()
+                ))
+            }
+            UnaryOp::BitNot => {
+                if !self.is_plain_int(&value.ty) {
+                    return Err(format!(
+                        "the unary `~` operator cannot be applied to `{}`",
+                        value.ty.name()
+                    ));
+                }
+                let result = build(
+                    self.builder
+                        .build_not(value.value.expect("integer operand").into_int_value(), "not"),
+                )?;
+                Ok(TypedValue {
+                    value: Some(result.into()),
+                    ty: value.ty,
+                })
+            }
+            UnaryOp::Ref => self.gen_ref(operand, expected),
+            UnaryOp::Deref => self.gen_deref(operand, expected),
+        }
+    }
+
+    /// Compute the address of a named field inside a struct value living at
+    /// `parent_slot`. Returns the field's pointer and its type.
+    fn field_pointer(
+        &self,
+        parent_slot: PointerValue<'ctx>,
+        parent: &Type,
+        field: &str,
+    ) -> Result<(PointerValue<'ctx>, Type), String> {
+        let Type::Struct { name, fields } = parent else {
+            return Err(format!(
+                "`{}` is not a struct type, so it has no field `{field}`",
+                parent.name()
+            ));
+        };
+        let index = fields
+            .iter()
+            .position(|(field_name, _)| field_name == field)
+            .ok_or_else(|| format!("struct `{name}` has no field `{field}`"))?;
+        let struct_ty = self.struct_llvm_type(name);
+        let pointer = build(self.builder.build_struct_gep(struct_ty, parent_slot, index as u32, field))?;
+        Ok((pointer, fields[index].1.clone()))
+    }
+
+    /// The address of the field `field` inside `base`. `base` must be a
+    /// variable or another field access — field access only makes sense on an
+    /// addressable (place) expression.
+    fn field_address(
+        &mut self,
+        base: &Expr,
+        field: &str,
+    ) -> Result<(PointerValue<'ctx>, Type), String> {
+        match base {
+            Expr::Var(name) => {
+                let (slot, ty) = self
+                    .lookup(name)
+                    .ok_or_else(|| format!("use of undefined variable `{name}`"))?;
+                self.field_pointer(slot, &ty, field)
+            }
+            Expr::Field { base, field: inner_field } => {
+                let (slot, ty) = self.field_address(base, inner_field)?;
+                self.field_pointer(slot, &ty, field)
+            }
+            _ => Err(
+                "field access is only supported on a variable or another field access, for example `p.x` or `p.inner.x`"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Take the address of a variable: the result is a `word` holding the
+    /// address, which a later dereference (`*`) can load through. Only
+    /// `word`-typed variables are addressable for now; `short` and `byte`
+    /// variables are skipped.
+    fn gen_ref(
+        &mut self,
+        operand: &Expr,
+        _expected: Option<Type>,
+    ) -> Result<TypedValue<'ctx>, String> {
+        let Expr::Var(name) = operand else {
+            return Err("`&` (address-of) can only be applied to a variable".to_string());
+        };
+        let (slot, ty) = self
+            .lookup(name)
+            .ok_or_else(|| format!("cannot take the address of undefined variable `{name}`"))?;
+        if ty != Type::Word {
+            return Err(format!(
+                "`&` (address-of) is only available for `word` values right now (variable `{name}` is `{}`)",
+                ty.name()
+            ));
+        }
+        let address = build(self.builder.build_ptr_to_int(slot, self.context.i64_type(), "ref"))?;
+        Ok(TypedValue {
+            value: Some(address.into()),
+            ty: Type::Word,
+        })
+    }
+
+    /// Dereference an address held in a `word`: load through it and yield the
+    /// referenced value as a `word`.
+    fn gen_deref(
+        &mut self,
+        operand: &Expr,
+        _expected: Option<Type>,
+    ) -> Result<TypedValue<'ctx>, String> {
+        let value = self.gen_expr(operand, Some(Type::Word))?;
+        if value.ty != Type::Word {
+            return Err(format!(
+                "cannot dereference a value of type `{}` (an address is a `word`)",
+                value.ty.name()
+            ));
+        }
+        let int = value.value.expect("deref operand has a value");
+        let int_value = int.into_int_value();
+        let pointer = build(
+            self.builder
+                .build_int_to_ptr(int_value, self.context.ptr_type(AddressSpace::default()), "deref"),
+        )?;
+        let loaded = build(self.builder.build_load(self.llvm_type(Type::Word), pointer, "deref.load"))?;
+        Ok(TypedValue {
+            value: Some(loaded.into_int_value().into()),
+            ty: Type::Word,
+        })
+    }
+
+    /// Lower a binary operation: arithmetic or bitwise, on integers and
+    /// floating-point values.
+    fn gen_binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        expected: Option<Type>,
+    ) -> Result<TypedValue<'ctx>, String> {
+        let lhs_value = self.gen_expr(lhs, expected.clone())?;
+        if lhs_value.ty.is_void() {
+            return Err("cannot apply a binary operation to `void`".to_string());
+        }
+        let rhs_value = self.gen_expr(rhs, expected)?;
+        if rhs_value.ty.is_void() {
+            return Err("cannot apply a binary operation to `void`".to_string());
+        }
+        if lhs_value.ty.is_struct() || rhs_value.ty.is_struct() {
+            return Err(format!(
+                "the `{}` operator cannot be applied to a struct value (operate on its fields instead)",
+                op_symbol(op)
+            ));
+        }
+
+        let (result_ty, lhs_value, rhs_value) = if lhs_value.ty.is_float() || rhs_value.ty.is_float() {
+            // Floating-point arithmetic (possibly after widening an integer).
+            let result_ty = if lhs_value.ty.is_float() {
+                lhs_value.ty.clone()
+            } else {
+                rhs_value.ty.clone()
+            };
+            let lhs = if lhs_value.ty == result_ty {
+                lhs_value
+            } else {
+                self.coerce(lhs_value, result_ty.clone())?
+            };
+            let rhs = if rhs_value.ty == result_ty {
+                rhs_value
+            } else {
+                self.coerce(rhs_value, result_ty.clone())?
+            };
+            (result_ty, lhs, rhs)
+        } else {
+            // Integer arithmetic or bitwise operation. Pick the wider type;
+            // widening is the language's only conversion.
+            let result_ty = if lhs_value.ty == rhs_value.ty {
+                lhs_value.ty.clone()
+            } else if rhs_value.ty.can_widen_to(&lhs_value.ty) {
+                rhs_value.ty.clone()
+            } else if lhs_value.ty.can_widen_to(&rhs_value.ty) {
+                lhs_value.ty.clone()
+            } else {
+                return Err(format!(
+                    "cannot combine `{}` and `{}`",
+                    lhs_value.ty.name(),
+                    rhs_value.ty.name()
+                ));
+            };
+            let lhs = if lhs_value.ty == result_ty {
+                lhs_value
+            } else {
+                self.coerce(lhs_value, result_ty.clone())?
+            };
+            let rhs = if rhs_value.ty == result_ty {
+                rhs_value
+            } else {
+                self.coerce(rhs_value, result_ty.clone())?
+            };
+            (result_ty, lhs, rhs)
+        };
+
+        if result_ty == Type::Bool {
+            return Err(format!(
+                "the `{}` operator is not available for `{}` yet (widen the operands first)",
+                op_symbol(op),
+                result_ty.name()
+            ));
+        }
+
+        if is_bitwise(op) && result_ty.is_float() {
+            return Err(format!(
+                "the `{}` operator cannot be applied to floating-point type `{}`",
+                op_symbol(op),
+                result_ty.name()
+            ));
+        }
+
+        let value = if result_ty.is_float() {
+            let lhs = lhs_value.value.expect("operand has a value");
+            let rhs = rhs_value.value.expect("operand has a value");
+            let lhs = lhs.into_float_value();
+            let rhs = rhs.into_float_value();
+            let result = match op {
+                BinaryOp::Add => build(self.builder.build_float_add(lhs, rhs, "add"))?,
+                BinaryOp::Sub => build(self.builder.build_float_sub(lhs, rhs, "sub"))?,
+                BinaryOp::Mul => build(self.builder.build_float_mul(lhs, rhs, "mul"))?,
+                BinaryOp::Div => build(self.builder.build_float_div(lhs, rhs, "div"))?,
+                BinaryOp::Rem => build(self.builder.build_float_rem(lhs, rhs, "rem"))?,
+                _ => unreachable!("the result of a floating-point operation is never a bitwise one"),
+            };
+            TypedValue {
+                value: Some(result.into()),
+                ty: result_ty,
+            }
+        } else {
+            let lhs = lhs_value.value.expect("operand has a value");
+            let rhs = rhs_value.value.expect("operand has a value");
+            let lhs = lhs.into_int_value();
+            let rhs = rhs.into_int_value();
+            let result = match op {
+                BinaryOp::Add => build(self.builder.build_int_add(lhs, rhs, "add"))?,
+                BinaryOp::Sub => build(self.builder.build_int_sub(lhs, rhs, "sub"))?,
+                BinaryOp::Mul => build(self.builder.build_int_mul(lhs, rhs, "mul"))?,
+                BinaryOp::Div => build(self.builder.build_int_signed_div(lhs, rhs, "div"))?,
+                BinaryOp::Rem => build(self.builder.build_int_signed_rem(lhs, rhs, "rem"))?,
+                BinaryOp::And => build(self.builder.build_and(lhs, rhs, "and"))?,
+                BinaryOp::Or => build(self.builder.build_or(lhs, rhs, "or"))?,
+                BinaryOp::Xor => build(self.builder.build_xor(lhs, rhs, "xor"))?,
+                BinaryOp::Shl => build(self.builder.build_left_shift(lhs, rhs, "shl"))?,
+                BinaryOp::Shr => build(self.builder.build_right_shift(lhs, rhs, true, "shr"))?,
+            };
+            TypedValue {
+                value: Some(result.into()),
+                ty: result_ty,
+            }
+        };
+
+        Ok(value)
     }
 
     fn gen_call(
@@ -1013,9 +1462,9 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         let mut values = Vec::with_capacity(args.len());
-        for (arg, &param) in args.iter().zip(&sig.params) {
-            let value = self.gen_expr(arg, Some(param))?;
-            let value = self.coerce(value, param)?;
+        for (arg, param) in args.iter().zip(&sig.params) {
+            let value = self.gen_expr(arg, Some(param.clone()))?;
+            let value = self.coerce(value, param.clone())?;
             values.push(value.value.expect("argument value").into());
         }
 
@@ -1056,6 +1505,11 @@ impl<'ctx> Codegen<'ctx> {
         if result_ty.is_void() {
             return Err("asm block cannot have `void` result type".to_string());
         }
+        if result_ty.is_struct() {
+            return Err(
+                format!("asm block cannot produce a `{}` value (struct values have no register constraint)", result_ty.name())
+            );
+        }
         let (template, inputs) = rewrite_asm(source);
 
         let mut args = Vec::with_capacity(inputs.len());
@@ -1065,21 +1519,33 @@ impl<'ctx> Codegen<'ctx> {
             let (slot, ty) = self
                 .lookup(name)
                 .ok_or_else(|| format!("asm block references undefined variable `${name}`"))?;
-            let value = build(self.builder.build_load(self.llvm_type(ty), slot, name))?;
+            let value = build(self.builder.build_load(self.llvm_type(ty.clone()), slot, name))?;
             args.push(value.into());
-            param_types.push(self.llvm_type(ty).into());
+            param_types.push(self.llvm_type(ty.clone()).into());
             input_types.push(ty);
         }
 
-        let fn_type = self.fn_type(result_ty, &param_types);
+        let fn_type = self.fn_type(result_ty.clone(), &param_types);
 
         // One output followed by one input register per variable. Floating-point
-        // operands use the `x` constraint (SSE registers), integers use `r`.
-        let constraint_for = |ty: Type| if ty.is_float() { "x" } else { "r" };
-        let mut constraints = format!("={}", constraint_for(result_ty));
-        for &ty in &input_types {
+        // operands use the `x` constraint (SSE registers), integers use `r`;
+        // struct values have no constraint and are rejected.
+        let constraint_for = |ty: &Type| -> Result<&'static str, String> {
+            if ty.is_float() {
+                Ok("x")
+            } else if self.is_plain_int(ty) {
+                Ok("r")
+            } else {
+                Err(format!(
+                    "asm blocks cannot take `{}` operands (only integers and floating-point values have register constraints)",
+                    ty.name()
+                ))
+            }
+        };
+        let mut constraints = format!("={}", constraint_for(&result_ty)?);
+        for ty in &input_types {
             constraints.push(',');
-            constraints.push_str(constraint_for(ty));
+            constraints.push_str(constraint_for(ty)?);
         }
 
         let asm = self.context.create_inline_asm(
@@ -1113,8 +1579,8 @@ impl<'ctx> Codegen<'ctx> {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
-            .or_else(|| self.globals.get(name).copied())
+            .find_map(|scope| scope.get(name).cloned())
+            .or_else(|| self.globals.get(name).cloned())
     }
 }
 
@@ -1715,6 +2181,117 @@ mod tests {
     }
 
     #[test]
+    fn emits_addition_for_words() {
+        let text = ir("f(a : word, b : word) : word a + b;");
+        assert!(text.contains("add i64"), "{text}");
+        assert!(text.contains("ret i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_subtraction_multiplication_and_division() {
+        let text = ir("f(a : word, b : word) : word a - b * a / b;");
+        assert!(text.contains("sub i64"), "{text}");
+        assert!(text.contains("mul i64"), "{text}");
+        assert!(text.contains("sdiv i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_remainder() {
+        let text = ir("f(a : word, b : word) : word a % b;");
+        assert!(text.contains("srem i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_float_arithmetic() {
+        let text = ir("f(x : float, y : float) : float x + y;");
+        assert!(text.contains("fadd float"), "{text}");
+        let text = ir("f(x : double, y : double) : double x * y;");
+        assert!(text.contains("fmul double"), "{text}");
+    }
+
+    #[test]
+    fn emits_bitwise_operations() {
+        let text = ir("f(a : word, b : word) : word a & b;");
+        assert!(text.contains("and i64"), "{text}");
+        let text = ir("f(a : word, b : word) : word a | b;");
+        assert!(text.contains("or i64"), "{text}");
+        let text = ir("f(a : word, b : word) : word a ^ b;");
+        assert!(text.contains("xor i64"), "{text}");
+        let text = ir("f(a : word) : word ~a;");
+        assert!(text.contains("xor i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_shifts() {
+        let text = ir("f(a : word, b : word) : word a << b;");
+        assert!(text.contains("shl i64"), "{text}");
+        let text = ir("f(a : word, b : word) : word a >> b;");
+        assert!(text.contains("ashr i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_unary_negation() {
+        let text = ir("f(x : word) : word -x;");
+        assert!(text.contains("ret i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_ref_and_deref_for_words() {
+        let text = ir("f(x : word) : word { auto y : word; y = &x; *y }");
+        assert!(text.contains("ptrtoint"), "{text}");
+        assert!(text.contains("inttoptr"), "{text}");
+        assert!(text.contains("load i64"), "{text}");
+    }
+
+    #[test]
+    fn emits_arithmetic_on_short() {
+        let text = ir("f(x : short) : short { auto y : short; y = x + x; y }");
+        assert!(text.contains("add i16"), "{text}");
+    }
+
+    #[test]
+    fn emits_arithmetic_on_short_two_operands() {
+        let text = ir("f(a : short, b : short) : short a + b;");
+        assert!(text.contains("add i16"), "{text}");
+        let text = ir("f(a : short, b : short) : short a * b;");
+        assert!(text.contains("mul i16"), "{text}");
+    }
+
+    #[test]
+    fn rejects_ref_on_a_narrow_integer() {
+        let error = ir_err("f(x : byte) : word { auto y : word; y = &x; }");
+        assert!(error.contains("only available for `word`"), "{error}");
+    }
+
+    #[test]
+    fn emits_arithmetic_on_byte() {
+        let text = ir("f(a : byte, b : byte) : byte a + b;");
+        assert!(text.contains("add i8"), "{text}");
+        let text = ir("f(a : byte, b : byte) : byte a - b;");
+        assert!(text.contains("sub i8"), "{text}");
+    }
+
+    #[test]
+    fn emits_bitwise_operations_on_short_and_byte() {
+        let text = ir("f(a : byte, b : byte) : byte a & b;");
+        assert!(text.contains("and i8"), "{text}");
+        let text = ir("f(a : short, b : short) : short a << b;");
+        assert!(text.contains("shl i16"), "{text}");
+    }
+
+    #[test]
+    fn emits_unary_negation_on_byte() {
+        let text = ir("f(x : byte) : byte -x;");
+        assert!(text.contains("ret i8"), "{text}");
+    }
+
+    #[test]
+    fn rejects_arithmetic_on_bool() {
+        let error = ir_err("f(x : bool) : bool x + x;");
+        assert!(error.contains("not available for `bool`"), "{error}");
+    }
+
+    #[test]
     fn inexact_integer_literal_for_float_is_rejected() {
         // 2^24 + 1 is not representable in f32.
         let error = ir_err("f() : float 16777217;");
@@ -1779,5 +2356,218 @@ mod tests {
     fn int_literal_adopts_float_global_initializer() {
         let text = ir("two : double 2;");
         assert!(text.contains("@two = global double 2.000000e+00"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod struct_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn ir(source: &str) -> String {
+        let program = parse(tokenize(source).expect("tokenizes")).expect("parses");
+        generate(&program, "test").expect("generates")
+    }
+
+    fn ir_err(source: &str) -> String {
+        let program = parse(tokenize(source).expect("tokenizes")).expect("parses");
+        generate(&program, "test").unwrap_err()
+    }
+
+    #[test]
+    fn emits_named_struct_types_and_zeroed_globals() {
+        let text = ir("point : struct { x : word, y : word };\norigin : point;\nmain() : word { 0 }");
+        assert!(text.contains("%point = type { i64, i64 }"), "{text}");
+        assert!(text.contains("@origin = global %point zeroinitializer"), "{text}");
+    }
+
+    #[test]
+    fn struct_locals_are_zero_initialised() {
+        let text = ir(
+            "point : struct { x : int, y : short };\nf() : word { auto p : point; 0 }",
+        );
+        assert!(text.contains("%point = type { i32, i16 }"), "{text}");
+        assert!(text.contains("%p = alloca %point"), "{text}");
+        assert!(text.contains("store %point zeroinitializer"), "{text}");
+    }
+
+    #[test]
+    fn structs_are_never_anonymous_in_the_ir() {
+        let text = ir("point : struct { x : word };\nmain() : word { auto p : point; 0 }");
+        assert!(!text.contains("%struct."), "{text}");
+        assert!(text.contains("%point = type { i64 }"), "{text}");
+    }
+
+    #[test]
+    fn field_read_and_assignment_emit_geps() {
+        let text = ir(
+            "point : struct { x : word, y : word };\nq(p : point) : word { p.x + p.y }",
+        );
+        assert!(text.contains("getelementptr inbounds"), "{text}");
+        assert!(text.contains("load i64"), "{text}");
+        assert!(text.contains("add i64"), "{text}");
+    }
+
+    #[test]
+    fn field_assignment_stores_through_a_gep() {
+        let text = ir(
+            "point : struct { x : word, y : word };\n\
+             main() : word { auto p : point; p.x = 5; p.y = 7; 0 }",
+        );
+        assert!(text.contains("store i64 5"), "{text}");
+        assert!(text.contains("store i64 7"), "{text}");
+    }
+
+    #[test]
+    fn nested_struct_fields_chain_geps() {
+        let text = ir(
+            "inner : struct { n : word };\n\
+             outer : struct { inner : inner, m : word };\n\
+             main() : word { auto s : outer; s.inner.n = 42; s.inner.n }",
+        );
+        assert!(text.contains("%outer = type { %inner, i64 }"), "{text}");
+        assert!(text.contains("%inner = type { i64 }"), "{text}");
+        assert!(text.contains("getelementptr"), "{text}");
+    }
+
+    #[test]
+    fn struct_arguments_and_returns_are_passed_by_value() {
+        let text = ir(
+            "point : struct { x : word, y : word };\n\
+             add(p : point, q : point) : point { auto out : point; out.x = p.x + q.x; out }\n\
+             main() : word { 0 }",
+        );
+        assert!(text.contains("@add(%point %0, %point %1)"), "{text}");
+        assert!(text.contains("define %point @add("), "{text}");
+    }
+
+    #[test]
+    fn struct_whole_value_assignment_between_same_type_copy() {
+        let text = ir(
+            "point : struct { x : word };\n\
+             main() : word { auto a : point; auto b : point; a = b; 0 }",
+        );
+        assert!(text.contains("load %point"), "{text}");
+        assert!(text.contains("store %point"), "{text}");
+    }
+
+    #[test]
+    fn struct_globals_can_be_read_and_written() {
+        let text = ir(
+            "point : struct { x : word };\n\
+             origin : point;\n\
+             main() : word { origin.x = 1; origin.x }",
+        );
+        assert!(text.contains("@origin = global %point zeroinitializer"), "{text}");
+        assert!(text.contains("store i64 1"), "{text}");
+    }
+
+    fn parse_err(source: &str) -> String {
+        parse(tokenize(source).expect("tokenizes")).unwrap_err()
+    }
+
+    #[test]
+    fn a_struct_field_cannot_reference_a_later_struct() {
+        let error = parse_err(
+            "outer : struct { inner : inner };\ninner : struct { n : word };\nmain() : word { 0 }",
+        );
+        assert!(error.contains("unknown type `inner`"), "{error}");
+    }
+
+    #[test]
+    fn assigning_a_struct_to_a_field_of_another_struct_is_supported() {
+        let text = ir(
+            "inner : struct { n : word };\n\
+             outer : struct { inner : inner, m : word };\n\
+             main() : word { auto s : outer; s.inner.n = 3; s.inner.n + 41 }",
+        );
+        assert!(text.contains("add i64"), "{text}");
+    }
+
+    #[test]
+    fn a_struct_cannot_be_combined_with_an_integer() {
+        let error = ir_err(
+            "point : struct { x : word };\nmain() : word { auto p : point; p }",
+        );
+        assert!(error.contains("cannot implicitly convert `point` to `word`"), "{error}");
+    }
+
+    #[test]
+    fn arithmetic_on_a_struct_is_rejected() {
+        // The struct operand reaches the binary-operator check when the whole
+        // expression has no expected type (a condition position).
+        let error = ir_err(
+            "point : struct { x : word };\nmain() : word { auto p : point; auto q : point; if p + q { 1 } else { 0 }; 0 }",
+        );
+        assert!(error.contains("cannot be applied to a struct value"), "{error}");
+    }
+
+    #[test]
+    fn a_struct_cannot_be_an_if_condition() {
+        let error = ir_err(
+            "point : struct { x : word };\nf(p : point) : word if p { 1 } else { 2 };",
+        );
+        assert!(error.contains("cannot use `point` as a condition"), "{error}");
+    }
+
+    #[test]
+    fn struct_conditions_through_fields_work() {
+        let text = ir(
+            "point : struct { x : word };\n\
+             f(p : point) : word if p.x { 1 } else { 2 };",
+        );
+        assert!(text.contains("icmp ne"), "{text}");
+    }
+
+    #[test]
+    fn zero_operand_struct_field_of_same_type_assigns() {
+        let text = ir(
+            "point : struct { x : word, y : word };\n\
+             q(p : point) : word { p.x = p.y; p.x }",
+        );
+        assert!(text.contains("store i64"), "{text}");
+    }
+
+    #[test]
+    fn rejects_assigning_to_a_non_struct_field() {
+        let error = ir_err(
+            "point : struct { x : word };\nf(p : point) : word { p.nope = 1; 3 }",
+        );
+        assert!(error.contains("struct `point` has no field `nope`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_field_access_on_a_primitive() {
+        let error = ir_err("f(x : word) : word { x.nope }");
+        assert!(error.contains("`word` is not a struct type"), "{error}");
+    }
+
+    #[test]
+    fn print_cannot_be_named_as_a_struct() {
+        let error = parse_err("print : struct { x : word };\nmain() : word { 0 }");
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn extern_signatures_cannot_mention_struct_types() {
+        let error = ir_err(
+            "point : struct { x : word };\nextern tick(point) : word;\nmain() : word { 0 }",
+        );
+        assert!(error.contains("`extern` signatures cannot use struct types"), "{error}");
+    }
+
+    #[test]
+    fn main_cannot_return_a_struct() {
+        let error = ir_err("point : struct { x : word };\nmain() : point { auto p : point; p }");
+        assert!(error.contains("`main` cannot return a struct type"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_struct_definitions_are_rejected() {
+        let error = parse_err(
+            "point : struct { x : word };\npoint : struct { y : word };\nmain() : word { 0 }",
+        );
+        assert!(error.contains("defined more than once"), "{error}");
     }
 }

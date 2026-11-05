@@ -1,0 +1,71 @@
+// Structs: named, never anonymous, never declared inline.
+//
+//   point : struct { x : word, y : word };   // declares a named struct type
+//   auto p : point;                          // locals are zero-initialised
+//   p.x = 5;                                 // fields are assignable
+//   p.y = p.x + 1;                           // ... and readable
+//   p.inner.x = 5;                           // nested structs work
+//
+// Struct types are declared at the top level before being used; a struct may
+// only mention structs declared earlier in the same file. HSPL-to-HSPL calls
+// pass structs by value; `main` cannot return one. A struct has no literal
+// syntax — it is constructed by declaring a value and assigning its fields.
+// Structs are named in the IR; nothing is anonymous or inlined by accident.
+
+extern print(word) : word;
+
+point : struct {
+    x : word,
+    y : word,
+};
+
+offset : struct {
+    base : point,
+    dx : word,
+    dy : word,
+};
+
+add(a : point, b : point) : point {
+    auto out : point;
+    out.x = a.x + b.x;
+    out.y = a.y + b.y;
+    out
+}
+
+sum_coords(p : point) : word p.x + p.y;
+
+// A struct global, zero-initialised.
+origin : point;
+
+main() : word {
+    auto a : point;   // `a` starts as { x : 0, y : 0 }
+    a.x = 20;
+    a.y = 22;
+    print(sum_coords(a));   // 42
+
+    auto b : point;
+    b.x = 1;
+    b.y = 2;
+    auto c : point;
+    c = add(a, b);
+    print(c.x);             // 21
+    print(c.y);             // 24
+
+    // Whole-struct assignment copies the value.
+    origin = c;
+    origin.x = origin.x + 10;
+    print(origin.x);        // 31
+
+    // Structs nest inside other structs.
+    auto s : offset;
+    s.base.x = 6;
+    s.base.y = 7;
+    s.dx = 1;
+    s.dy = 1;
+    print(sum_coords(s.base) + s.dx + s.dy);   // 15
+
+    // Locals are mutable through fields; nested fields chain.
+    s.base.x = a.x + b.x;
+    print(s.base.x);        // 21
+    0
+}

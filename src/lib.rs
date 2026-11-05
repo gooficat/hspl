@@ -1,14 +1,16 @@
 //! HSPL: Hasan's Simple Programming Language.
 //!
-//! A small B-like language that compiles to LLVM IR. Values have one of eight
+//! A small B-like language that compiles to LLVM IR. Values have one of nine
 //! types: five integer types (`word`, `int`, `short`, `byte`, `bool`), two
-//! IEEE-754 floating-point types (`float`, `double`), plus
-//! `void`, which is only valid as a function or `extern` return type and is
-//! the default when no return type is given. Types are
-//! written after names as in `f(x : int) : byte`. There are no operators and no
-//! `return` statements: every function body is a single statement whose value
-//! is the function's result. Control flow is `if` expressions plus `jump` and
-//! labels. Inline assembly blocks provide the escape hatch for real machine
+//! IEEE-754 floating-point types (`float`, `double`), named struct types,
+//! plus `void`, which is only valid as a function or `extern` return type
+//! and is the default when no return type is given. Types are written after
+//! names as in `f(x : int) : byte`. There are no comparison or
+//! logical operators yet, and no `return` statements: every function body is a
+//! single statement whose value is the function's result. Arithmetic
+//! (`+ - * / %`), bitwise (`& | ^ ~ << >>`) and reference (`&`/`*`) operators
+//! are expressions; control flow is `if` expressions plus `jump` and labels.
+//! Inline assembly blocks provide the escape hatch for real machine
 //! operations, and `extern` imports typed symbols such as the standard library's
 //! `print`.
 //!
